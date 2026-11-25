@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from scraper import extract_product
-from scraper.sku_resolver import resolve_tanishq_url
+from scraper.sku_resolver import ResolverBlockedError, resolve_tanishq_url
 
 IST = timezone(timedelta(hours=5, minutes=30))
 STALE_RUNNING_MINUTES = 30
@@ -141,7 +141,23 @@ def _process_sku(
             on_conflict="sku_code",
         ).execute()
 
-    product_url = cached_url or resolve_tanishq_url(sku_code)
+    try:
+        product_url = cached_url or resolve_tanishq_url(sku_code)
+    except ResolverBlockedError as exc:
+        payload = {
+            "sku_code": sku_code,
+            "product_url": None,
+            "price": None,
+            "currency": None,
+            "stock_status": "unknown",
+            "scrape_status": "error",
+            "scrape_error": str(exc),
+            "scraped_at": _utc_now_iso(),
+        }
+        if not dry_run and client is not None:
+            client.table("sku_market_data").upsert(payload, on_conflict="sku_code").execute()
+        return payload
+
     if not product_url:
         payload = {
             "sku_code": sku_code,
