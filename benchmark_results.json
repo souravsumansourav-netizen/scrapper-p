@@ -1,0 +1,72 @@
+[
+  {
+    "url": "https://www.tanishq.co.in/product/blooming-floral-traditional-diamond-stud-earrings-501002sfsaaa2a.html?lang=en_IN",
+    "title": "Blooming Floral Traditional Diamond Stud Earrings",
+    "price": 56343.0,
+    "currency": "INR",
+    "stock_status": "in_stock_online",
+    "tier": "tier3",
+    "error": null,
+    "latency_s": 5.216
+  },
+  {
+    "url": "https://www.tanishq.co.in/product/eternal-grace-solitaire-mangalsutra-hls1d1yapa537.html?lang=en_IN",
+    "title": "Eternal Grace Solitaire Mangalsutra",
+    "price": 168084.0,
+    "currency": "INR",
+    "stock_status": "in_stock_store_only",
+    "tier": "tier3",
+    "error": null,
+    "latency_s": 5.562
+  },
+  {
+    "url": "https://www.tanishq.co.in/product/blooming-poppy-necklace-set-50o6rm2afdba32.html?lang=en_IN",
+    "title": "Blooming Poppy Necklace Set",
+    "price": 5359956.0,
+    "currency": "INR",
+    "stock_status": "in_stock_store_only",
+    "tier": "tier3",
+    "error": null,
+    "latency_s": 5.178
+  },
+  {
+    "url": "https://www.tanishq.co.in/product/blooming-muse-diamond-bangle-50o6rmvbb1a32.html?lang=en_IN",
+    "title": "Blooming Muse Diamond Bangle",
+    "price": 916599.0,
+    "currency": "INR",
+    "stock_status": "in_stock_store_only",
+    "tier": "tier3",
+    "error": null,
+    "latency_s": 5.249
+  },
+  {
+    "url": "https://www.tanishq.co.in/product/floral-sparkle-diamond-stud-earrings-50d3ptsbgaaa09.html?lang=en_IN",
+    "title": "Floral Sparkle Diamond Stud Earrings",
+    "price": 50284.0,
+    "currency": "INR",
+    "stock_status": "in_stock_online",
+    "tier": "tier3",
+    "error": null,
+    "latency_s": 5.377
+  },
+  {
+    "url": "https://www.caratlane.com/jewellery/classic-gemstone-bangle-jb00957-ygs3nv.html",
+    "title": "Classic Gemstone Bangle",
+    "price": 121018.0,
+    "currency": "INR",
+    "stock_status": "in_stock_online",
+    "tier": "tier1",
+    "error": null,
+    "latency_s": 0.598
+  },
+  {
+    "url": "https://www.bluestone.com/pendants/the-circinus-pendant~28249.html",
+    "title": "The Circinus Pendant",
+    "price": 18181.0,
+    "currency": "INR",
+    "stock_status": "in_stock_online",
+    "tier": "tier2",
+    "error": null,
+    "latency_s": 0.588
+  }
+]
