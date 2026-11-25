@@ -1,7 +1,9 @@
 import argparse
 import json
 import os
+import random
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +12,7 @@ from scraper.sku_resolver import ResolverBlockedError, resolve_tanishq_url
 
 IST = timezone(timedelta(hours=5, minutes=30))
 STALE_RUNNING_MINUTES = 30
+RETRY_DELAY_SECONDS = 3.0
 
 
 def _utc_now_iso() -> str:
@@ -129,6 +132,84 @@ def _collect_daily_skus(client: Any) -> List[Dict[str, Optional[str]]]:
     return targets
 
 
+def _format_scrape_error(extracted: Dict[str, Any]) -> str:
+    """Return a specific, diagnostic error reason for failed extractions."""
+    raw_err = (extracted.get("error") or "").strip()
+    if raw_err:
+        lower = raw_err.lower()
+        if "http 403" in lower:
+            return f"HTTP 403 blocked ({raw_err})"
+        if "http 429" in lower:
+            return f"HTTP 429 rate-limited ({raw_err})"
+        if "timeout" in lower or "timed out" in lower:
+            return f"Playwright timeout ({raw_err})"
+        return raw_err
+
+    if extracted.get("price") is None:
+        return "No price found on page"
+    return "No stock or price data extracted"
+
+
+def _attempt_scrape(sku_code: str, cached_url: Optional[str]) -> Dict[str, Any]:
+    """Run one attempt of SKU URL resolution + product extraction."""
+    try:
+        product_url = cached_url or resolve_tanishq_url(sku_code)
+    except ResolverBlockedError as exc:
+        return {
+            "sku_code": sku_code,
+            "product_url": None,
+            "price": None,
+            "currency": None,
+            "stock_status": "unknown",
+            "scrape_status": "error",
+            "scrape_error": str(exc),
+            "scraped_at": _utc_now_iso(),
+        }
+
+    if not product_url:
+        return {
+            "sku_code": sku_code,
+            "product_url": None,
+            "price": None,
+            "currency": None,
+            "stock_status": "not_found",
+            "scrape_status": "done",
+            "scrape_error": None,
+            "scraped_at": _utc_now_iso(),
+        }
+
+    extracted = extract_product(product_url)
+    err = extracted.get("error")
+    has_core = extracted.get("price") is not None or extracted.get("stock_status") != "unknown"
+    is_done = has_core and not err
+    return {
+        "sku_code": sku_code,
+        "product_url": product_url,
+        "price": extracted.get("price"),
+        "currency": extracted.get("currency"),
+        "stock_status": extracted.get("stock_status", "unknown"),
+        "scrape_status": "done" if is_done else "error",
+        "scrape_error": None if is_done else _format_scrape_error(extracted),
+        "scraped_at": _utc_now_iso(),
+    }
+
+
+def _has_existing_good_data(client: Any, sku_code: str) -> bool:
+    """Return True if sku_market_data already has a non-null price or resolved stock_status."""
+    resp = (
+        client.table("sku_market_data")
+        .select("price, stock_status")
+        .eq("sku_code", sku_code)
+        .limit(1)
+        .execute()
+    )
+    rows = resp.data or []
+    if not rows:
+        return False
+    row = rows[0]
+    return row.get("price") is not None or row.get("stock_status") not in (None, "unknown")
+
+
 def _process_sku(
     sku_code: str,
     cached_url: Optional[str],
@@ -141,51 +222,24 @@ def _process_sku(
             on_conflict="sku_code",
         ).execute()
 
-    try:
-        product_url = cached_url or resolve_tanishq_url(sku_code)
-    except ResolverBlockedError as exc:
-        payload = {
-            "sku_code": sku_code,
-            "product_url": None,
-            "price": None,
-            "currency": None,
-            "stock_status": "unknown",
-            "scrape_status": "error",
-            "scrape_error": str(exc),
-            "scraped_at": _utc_now_iso(),
-        }
-        if not dry_run and client is not None:
-            client.table("sku_market_data").upsert(payload, on_conflict="sku_code").execute()
-        return payload
+    payload = _attempt_scrape(sku_code, cached_url)
 
-    if not product_url:
-        payload = {
-            "sku_code": sku_code,
-            "product_url": None,
-            "price": None,
-            "currency": None,
-            "stock_status": "not_found",
-            "scrape_status": "done",
-            "scrape_error": None,
-            "scraped_at": _utc_now_iso(),
-        }
-    else:
-        extracted = extract_product(product_url)
-        err = extracted.get("error")
-        has_core = extracted.get("price") is not None or extracted.get("stock_status") != "unknown"
-        payload = {
-            "sku_code": sku_code,
-            "product_url": product_url,
-            "price": extracted.get("price"),
-            "currency": extracted.get("currency"),
-            "stock_status": extracted.get("stock_status", "unknown"),
-            "scrape_status": "done" if has_core and not err else "error",
-            "scrape_error": err,
-            "scraped_at": _utc_now_iso(),
-        }
+    # Automatic 1x retry after 3s on transient error
+    if payload["scrape_status"] == "error":
+        time.sleep(RETRY_DELAY_SECONDS)
+        payload = _attempt_scrape(sku_code, cached_url)
 
     if not dry_run and client is not None:
-        client.table("sku_market_data").upsert(payload, on_conflict="sku_code").execute()
+        if payload["scrape_status"] == "error" and _has_existing_good_data(client, sku_code):
+            # Preserve existing price, currency, stock_status, product_url, and scraped_at.
+            client.table("sku_market_data").update(
+                {
+                    "scrape_status": "error",
+                    "scrape_error": payload["scrape_error"],
+                }
+            ).eq("sku_code", sku_code).execute()
+        else:
+            client.table("sku_market_data").upsert(payload, on_conflict="sku_code").execute()
 
     return payload
 
@@ -217,7 +271,11 @@ def main() -> None:
             print("Provide --skus when using --dry-run (e.g. --skus 501002SFSAAA2A,50D3PTSBGAAA09)", file=sys.stderr)
             sys.exit(1)
         deduped = list(dict.fromkeys(raw_skus))
-        results = [_process_sku(code, None, None, dry_run=True) for code in deduped]
+        results = []
+        for idx, code in enumerate(deduped):
+            if idx > 0:
+                time.sleep(random.uniform(1.5, 3.0))
+            results.append(_process_sku(code, None, None, dry_run=True))
         print(json.dumps(results, indent=2, ensure_ascii=False))
         return
 
@@ -230,6 +288,8 @@ def main() -> None:
     print(f"[mode={args.mode}] Found {len(targets)} unique SKU(s) to process.")
 
     for idx, item in enumerate(targets, start=1):
+        if idx > 1:
+            time.sleep(random.uniform(1.5, 3.0))
         code = item["sku_code"]
         print(f"[{idx}/{len(targets)}] Processing {code}...")
         res = _process_sku(code, item.get("product_url"), client, dry_run=False)
