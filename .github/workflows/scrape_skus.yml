@@ -16,7 +16,7 @@ on:
       use_browser:
         description: 'Install Playwright Chromium for JS-heavy sites'
         required: false
-        default: false
+        default: true
         type: boolean
 
 concurrency:
@@ -43,17 +43,17 @@ jobs:
 
       - name: Cache Playwright Chromium
         id: playwright-cache
-        if: ${{ inputs.use_browser == true }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: Install Playwright Chromium
-        if: ${{ inputs.use_browser == true }}
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install chromium
+
+      - name: Install Playwright system dependencies
+        run: playwright install-deps chromium
 
       - name: Run Supabase sync worker
         env:
