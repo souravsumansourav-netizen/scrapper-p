@@ -9,6 +9,7 @@ from scraper import extract_product
 from scraper.sku_resolver import resolve_tanishq_url
 
 IST = timezone(timedelta(hours=5, minutes=30))
+STALE_RUNNING_MINUTES = 30
 
 
 def _utc_now_iso() -> str:
@@ -44,8 +45,33 @@ def _get_supabase_client() -> Any:
     return create_client(url, key)
 
 
+def _reset_stale_running(client: Any) -> int:
+    """Reset any `running` rows older than 30 minutes back to `queued`."""
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(minutes=STALE_RUNNING_MINUTES)
+    running_resp = (
+        client.table("sku_market_data")
+        .select("*")
+        .eq("scrape_status", "running")
+        .execute()
+    )
+    reset_count = 0
+    for row in running_resp.data or []:
+        code = (row.get("sku_code") or "").strip().upper()
+        if not code:
+            continue
+        ts_dt = (
+            _parse_iso(row.get("updated_at"))
+            or _parse_iso(row.get("scraped_at"))
+            or _parse_iso(row.get("created_at"))
+        )
+        if ts_dt is not None and ts_dt < cutoff_utc:
+            client.table("sku_market_data").update({"scrape_status": "queued"}).eq("sku_code", code).execute()
+            reset_count += 1
+    return reset_count
+
+
 def _collect_queued_skus(client: Any) -> List[Dict[str, Optional[str]]]:
-    """Return deduplicated list of {sku_code, product_url} for queued + unscraped untriaged SKUs."""
+    """Return deduplicated list of {sku_code, product_url} where scrape_status = 'queued'."""
     targets: Dict[str, Optional[str]] = {}
 
     queued_resp = (
@@ -58,19 +84,6 @@ def _collect_queued_skus(client: Any) -> List[Dict[str, Optional[str]]]:
         code = (row.get("sku_code") or "").strip().upper()
         if code and code not in targets:
             targets[code] = row.get("product_url")
-
-    existing_resp = client.table("sku_market_data").select("sku_code").execute()
-    existing_codes = {
-        (r.get("sku_code") or "").strip().upper()
-        for r in (existing_resp.data or [])
-        if r.get("sku_code")
-    }
-
-    untriaged_resp = client.table("skus").select("sku_code").eq("triaged", False).execute()
-    for row in untriaged_resp.data or []:
-        code = (row.get("sku_code") or "").strip().upper()
-        if code and code not in existing_codes and code not in targets:
-            targets[code] = None
 
     return [{"sku_code": code, "product_url": url} for code, url in targets.items()]
 
@@ -135,9 +148,9 @@ def _process_sku(
             "product_url": None,
             "price": None,
             "currency": None,
-            "stock_status": "unknown",
-            "scrape_status": "error",
-            "scrape_error": f"Could not resolve Tanishq URL for SKU {sku_code}",
+            "stock_status": "not_found",
+            "scrape_status": "done",
+            "scrape_error": None,
             "scraped_at": _utc_now_iso(),
         }
     else:
@@ -167,7 +180,7 @@ def main() -> None:
         "--mode",
         choices=["queued", "daily"],
         default="queued",
-        help="Sync mode: 'queued' (queued + unscraped untriaged) or 'daily' (stale untriaged SKUs).",
+        help="Sync mode: 'queued' (only scrape_status='queued') or 'daily' (stale untriaged SKUs).",
     )
     parser.add_argument(
         "--dry-run",
@@ -193,6 +206,10 @@ def main() -> None:
         return
 
     client = _get_supabase_client()
+    reset_count = _reset_stale_running(client)
+    if reset_count:
+        print(f"Reset {reset_count} stale 'running' SKU(s) back to 'queued'.")
+
     targets = _collect_queued_skus(client) if args.mode == "queued" else _collect_daily_skus(client)
     print(f"[mode={args.mode}] Found {len(targets)} unique SKU(s) to process.")
 
@@ -208,4 +225,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
