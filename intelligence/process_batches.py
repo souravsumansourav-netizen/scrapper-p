@@ -102,6 +102,19 @@ def _fetch_pending_batches(client: Any, batch_id: Optional[str]) -> List[Dict[st
             return []
         target = rows[0]
         target_allowed = target.get("status") in ("uploaded", "error", "processing")
+        # Pending Master (catalog) uploads have no period, so they would never join a
+        # period group; always include them so one "Run" click processes everything.
+        catalog_rows = list(
+            (
+                client.table("intel_upload_batches")
+                .select("*")
+                .in_("status", retryable_statuses)
+                .eq("source_type", "master")
+                .order("created_at", desc=False)
+                .execute()
+            ).data
+            or []
+        )
         p_start = target.get("period_start")
         p_end = target.get("period_end")
         if p_start and p_end:
@@ -115,10 +128,14 @@ def _fetch_pending_batches(client: Any, batch_id: Optional[str]) -> List[Dict[st
                 .execute()
             )
             group_rows = list(group_resp.data or [])
-            if target_allowed and all(r.get("id") != target.get("id") for r in group_rows):
-                group_rows.append(target)
-            return group_rows
-        return [target] if target_allowed else []
+        else:
+            group_rows = []
+        if target_allowed:
+            group_rows.append(target)
+        merged: Dict[str, Dict[str, Any]] = {}
+        for r in catalog_rows + group_rows:
+            merged.setdefault(str(r.get("id")), r)
+        return list(merged.values())
 
     resp = (
         client.table("intel_upload_batches")
