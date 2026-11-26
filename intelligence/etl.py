@@ -380,6 +380,15 @@ def parse_master_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
     filtered["styling"] = _pick(["STYLING"])
     filtered["short_description"] = _pick(["SHORT DESCRIPTION"])
     filtered["long_description"] = _pick(["LONG DESCRIPTION"])
+    img_col = _first_present_col(filtered, ["IMAGES 1", "IMAGE 1", "image_url"])
+    if img_col:
+        filtered["image_url"] = (
+            filtered[img_col]
+            .where(pd.notnull(filtered[img_col]), None)
+            .map(lambda v: str(v).strip() if v is not None and str(v).strip() not in {"", "nan", "None", "null"} else None)
+        )
+    else:
+        filtered["image_url"] = None
 
     filtered["design_tags"] = filtered.apply(lambda r: extract_design_dna(r.to_dict()), axis=1)
     return filtered, total_rows, excluded
@@ -587,6 +596,7 @@ def run_etl_pipeline(
             "collection",
             "design",
             "styling",
+            "image_url",
             "design_tags",
         ]
         master_attrs_df = master_df[[c for c in master_out_cols if c in master_df.columns]].copy()
