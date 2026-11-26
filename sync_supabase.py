@@ -240,8 +240,29 @@ def _process_sku(
             ).eq("sku_code", sku_code).execute()
         else:
             client.table("sku_market_data").upsert(payload, on_conflict="sku_code").execute()
+            if payload["scrape_status"] == "done":
+                _record_snapshot(client, payload)
 
     return payload
+
+
+def _record_snapshot(client: Any, payload: Dict[str, Any]) -> None:
+    """Append price/stock to sku_market_snapshots so history builds up for the intelligence model.
+
+    Never fails the scrape: if the table is missing (migration 0020 not applied) we just log.
+    """
+    try:
+        client.table("sku_market_snapshots").insert(
+            {
+                "sku_code": payload["sku_code"],
+                "scraped_at": payload["scraped_at"],
+                "price": payload.get("price"),
+                "currency": payload.get("currency"),
+                "stock_status": payload.get("stock_status"),
+            }
+        ).execute()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (snapshot not recorded for {payload['sku_code']}: {exc})")
 
 
 def main() -> None:

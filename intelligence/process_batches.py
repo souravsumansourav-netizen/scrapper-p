@@ -66,6 +66,17 @@ def _df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return records
 
 
+def _fetch_all(client: Any, table: str, columns: str, page_size: int = 1000) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        batch = client.table(table).select(columns).range(offset, offset + page_size - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            return rows
+        offset += page_size
+
+
 def _batch_source_type(batch: Dict[str, Any]) -> str:
     raw = (
         batch.get("source_type")
@@ -150,10 +161,18 @@ def _process_group(
                         f"endpoint_url={endpoint_url!r}: {ce}"
                     )
                     raise
-                if src_type in {"web", "oms", "perf", "master"}:
+                if src_type in {"web", "app", "oms", "perf", "master"}:
                     paths_by_type[src_type] = str(local_file)
 
+            # Stored catalog lets an App/Web upload resolve names without re-uploading the master CSV.
+            master_lookup_df = None
+            if "master" not in paths_by_type and period_start:
+                rows = _fetch_all(client, "sku_master_attributes", "sku_code, base_sku_13, title, category, published")
+                master_lookup_df = pd.DataFrame(rows) if rows else None
+
             period_df, master_attrs_df, stats = run_etl_pipeline(
+                app_path=paths_by_type.get("app"),
+                master_lookup_df=master_lookup_df,
                 web_path=paths_by_type.get("web"),
                 oms_path=paths_by_type.get("oms"),
                 perf_path=paths_by_type.get("perf"),
@@ -173,7 +192,10 @@ def _process_group(
                     ).execute()
 
             if not period_df.empty and period_start and period_end:
-                period_records = prepare_period_metrics_records(period_df)
+                # Only write columns for sources in this upload, so uploading App later
+                # does not zero out Web/OMS numbers already stored for the same period.
+                sources = set(paths_by_type) - {"master"}
+                period_records = prepare_period_metrics_records(period_df, sources=sources)
                 for i in range(0, len(period_records), batch_size):
                     client.table("sku_period_metrics").upsert(
                         period_records[i : i + batch_size],
@@ -182,12 +204,14 @@ def _process_group(
 
             match_pct = round(100.0 - stats.master_match_pct()["unmatched"], 2) if stats.period_skus > 0 else None
             ingested_map = {
+                "app": stats.app_skus,
                 "web": stats.web_skus,
                 "oms": stats.oms_skus,
                 "perf": stats.perf_skus,
                 "master": stats.master_skus,
             }
             excluded_map = {
+                "app": stats.app_excluded,
                 "web": stats.web_excluded,
                 "oms": stats.oms_excluded,
                 "perf": stats.perf_excluded,
@@ -243,8 +267,9 @@ def main() -> None:
         )
         grouped[key].append(b)
 
-    for group_key, group_batches in grouped.items():
-        _process_group(client, s3, bucket, group_key, group_batches)
+    # Catalog (master) uploads first, so period uploads in the same run can resolve against it.
+    for group_key in sorted(grouped, key=lambda k: k[2] != "catalog"):
+        _process_group(client, s3, bucket, group_key, grouped[group_key])
 
 
 if __name__ == "__main__":

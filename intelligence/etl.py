@@ -8,8 +8,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+from intelligence.categories import canonical_category
 from intelligence.design_dna import extract_design_dna
 from intelligence.filters import filter_jewellery
+
+PRICE_BAND_ALIASES = {
+    "<25k": "under_25k",
+    "25k-50k": "25k_50k",
+    "50k-1l": "50k_100k",
+    "1l+": "over_100k",
+}
 
 
 def normalize_sku(val: Any) -> str:
@@ -85,6 +93,12 @@ class ETLStats:
     master_total: int = 0
     master_excluded: int = 0
     master_skus: int = 0
+    app_total: int = 0
+    app_excluded: int = 0
+    app_rows_matched: int = 0
+    app_purchased_rows: int = 0
+    app_purchased_rows_matched: int = 0
+    app_skus: int = 0
     period_skus: int = 0
     match_exact: int = 0
     match_size_13: int = 0
@@ -143,16 +157,25 @@ def parse_web_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
     name_col = _first_present_col(filtered, ["Product Name", "product_name", "Item name"])
     cat_col = _first_present_col(filtered, ["Category", "category"])
     price_col = _first_present_col(filtered, ["Item price", "Price", "price"])
+    band_col = _first_present_col(filtered, ["Price Range", "price_range"])
 
     filtered["product_name"] = filtered[name_col].fillna("").astype(str).str.strip() if name_col else ""
     filtered["web_category"] = filtered[cat_col].fillna("").astype(str).str.strip() if cat_col else ""
     filtered["_unit_price"] = _to_num_series(filtered[price_col]) if price_col else 0.0
+    # Listed price band (GA4 item parameter). Present for every viewed item, so unlike
+    # purchase-derived price it does not reveal whether the item sold.
+    filtered["price_band"] = (
+        filtered[band_col].fillna("").astype(str).str.strip().str.lower().map(PRICE_BAND_ALIASES)
+        if band_col
+        else None
+    )
 
     agg = (
         filtered.groupby("sku_code", as_index=False)
         .agg(
             product_name=("product_name", _first_non_empty),
             web_category=("web_category", _first_non_empty),
+            price_band=("price_band", _first_non_empty),
             web_clicks=("web_clicks", "sum"),
             web_views=("web_views", "sum"),
             web_atc=("web_atc", "sum"),
@@ -176,6 +199,102 @@ def parse_web_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
     )
     agg = agg.drop(columns=["_fallback_price"])
     return agg, total_rows, excluded
+
+
+APP_METRIC_COLS = ("app_clicks", "app_views", "app_atc", "app_purchases", "app_revenue")
+
+
+def build_name_to_skus(
+    web_df: pd.DataFrame,
+    master_df: Optional[pd.DataFrame],
+) -> Dict[str, List[Tuple[str, float]]]:
+    """Map normalised product names to candidate SKUs with split weights.
+
+    Web names come with SKU IDs and view counts, so they are preferred; a name shared
+    by several SKUs is split in proportion to their web views. Master titles are the
+    fallback, split equally (published SKUs only when any exist for that title).
+    """
+    out: Dict[str, List[Tuple[str, float]]] = {}
+    if web_df is not None and not web_df.empty and "product_name" in web_df.columns:
+        tmp = web_df[["sku_code", "product_name", "web_views"]].copy()
+        tmp["norm"] = tmp["product_name"].map(normalize_name)
+        tmp = tmp[tmp["norm"] != ""]
+        for norm, grp in tmp.groupby("norm"):
+            views = grp["web_views"].astype(float).clip(lower=0).to_numpy()
+            weights = views / views.sum() if views.sum() > 0 else np.full(len(grp), 1.0 / len(grp))
+            out[norm] = list(zip(grp["sku_code"].tolist(), weights.tolist()))
+
+    if master_df is not None and not master_df.empty and "norm_title" in master_df.columns:
+        tmp = master_df[["sku_code", "norm_title"]].copy()
+        tmp["published"] = master_df["published"] if "published" in master_df.columns else False
+        tmp = tmp[tmp["norm_title"].fillna("") != ""]
+        for norm, grp in tmp.groupby("norm_title"):
+            if norm in out:
+                continue
+            pub = grp[grp["published"] == True]  # noqa: E712
+            cands = (pub if not pub.empty else grp)["sku_code"].tolist()
+            out[norm] = [(c, 1.0 / len(cands)) for c in cands]
+    return out
+
+
+def parse_app_csv(
+    path: str,
+    name_to_skus: Dict[str, List[Tuple[str, float]]],
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Parse the App (GA4) CSV, which has product names but no SKU IDs.
+
+    Each row is attributed to SKUs via `name_to_skus`; ambiguous names are split by weight.
+    Returns (per-SKU df, stats dict).
+    """
+    raw = pd.read_csv(path, dtype=str)
+    stats = {"total": len(raw), "excluded": 0, "matched": 0, "purchased": 0, "purchased_matched": 0}
+    name_col = _first_present_col(raw, ["Product Name", "product_name", "Item name"])
+    if not name_col:
+        raise ValueError(f"App CSV missing Product Name column: {list(raw.columns)}")
+
+    filtered, excluded = filter_jewellery(raw)
+    stats["excluded"] = excluded
+    if filtered.empty:
+        return pd.DataFrame(columns=["sku_code", *APP_METRIC_COLS]), stats
+
+    src = {
+        "app_clicks": _first_present_col(filtered, ["Items clicked in list"]),
+        "app_views": _first_present_col(filtered, ["Items viewed"]),
+        "app_atc": _first_present_col(filtered, ["Items added to cart"]),
+        "app_purchases": _first_present_col(filtered, ["Items purchased"]),
+        "app_revenue": _first_present_col(filtered, ["Gross item revenue"]),
+    }
+    metrics = pd.DataFrame(
+        {k: (_to_num_series(filtered[c]) if c else 0.0) for k, c in src.items()},
+        index=filtered.index,
+    )
+    norms = filtered[name_col].map(normalize_name)
+    cat_col = _first_present_col(filtered, ["Category", "category"])
+    app_cats = filtered[cat_col].fillna("").astype(str) if cat_col else pd.Series("", index=filtered.index)
+
+    rows: List[Dict[str, Any]] = []
+    for idx in filtered.index:
+        cands = name_to_skus.get(norms[idx])
+        bought = metrics.at[idx, "app_purchases"] > 0
+        stats["purchased"] += int(bought)
+        if not cands:
+            continue
+        stats["matched"] += 1
+        stats["purchased_matched"] += int(bought)
+        for sku, w in cands:
+            rec = {"sku_code": sku, "app_category": app_cats[idx]}
+            for col in APP_METRIC_COLS:
+                rec[col] = float(metrics.at[idx, col]) * w
+            rows.append(rec)
+
+    if not rows:
+        return pd.DataFrame(columns=["sku_code", *APP_METRIC_COLS]), stats
+    df = pd.DataFrame(rows)
+    agg = df.groupby("sku_code", as_index=False).agg(
+        app_category=("app_category", _first_non_empty),
+        **{col: (col, "sum") for col in APP_METRIC_COLS},
+    )
+    return agg, stats
 
 
 def parse_oms_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
@@ -203,8 +322,11 @@ def parse_oms_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
     filtered["oms_units"] = _to_num_series(filtered[units_col]) if units_col else 0.0
     filtered["oms_revenue"] = _to_num_series(filtered[rev_col]) if rev_col else 0.0
     filtered["oms_revenue_ratio"] = _to_num_series(filtered[ratio_col]) if ratio_col else 0.0
+    name_col = _first_present_col(filtered, ["productName", "Product Name"])
+    filtered["oms_product_name"] = filtered[name_col].fillna("").astype(str).str.strip() if name_col else ""
 
     agg = filtered.groupby("sku_code", as_index=False).agg(
+        oms_product_name=("oms_product_name", _first_non_empty),
         oms_units=("oms_units", "sum"),
         oms_revenue=("oms_revenue", "sum"),
         oms_revenue_ratio=("oms_revenue_ratio", "sum"),
@@ -369,10 +491,20 @@ def parse_master_csv(path: str) -> Tuple[pd.DataFrame, int, int]:
         c = _first_present_col(filtered, col_names)
         return filtered[c].fillna("").astype(str).str.strip() if c else pd.Series("", index=filtered.index)
 
-    filtered["category"] = _pick(["CATEGORY", "Category"])
-    filtered["product_type"] = _pick(["PRODUCT TYPE", "PRODUCT_TYPE"])
+    filtered["category"] = [
+        canonical_category(c, p, name=t)
+        for c, p, t in zip(_pick(["CATEGORY", "Category"]), _pick(["PRODUCT"]), filtered["master_title"])
+    ]
+    filtered["product_type"] = _pick(["JEWELLERY_TYPE", "PRODUCT TYPE", "PRODUCT_TYPE"])
+    filtered["metal"] = _pick(["METAL"])
     filtered["metal_color"] = _pick(["METAL COLOR", "METAL_COLOR"])
-    filtered["karatage"] = _pick(["KARATAGE"])
+    filtered["karatage"] = _pick(["GOLD_KARATAGE", "KARATAGE"])
+    filtered["diamond_clarity"] = _pick(["DIAMOND_CLARITY"])
+    filtered["weight_band"] = _pick(["WEIGHT BAND", "WEIGHT_BAND"])
+    _yes = {"1", "true", "yes", "y"}
+    filtered["published"] = _pick(["Published", "PUBLISHED"]).str.lower().isin(_yes)
+    filtered["is_new_collection"] = _pick(["NEW COLLECTION"]).str.lower().isin(_yes)
+    filtered["is_best_deal"] = _pick(["BEST DEAL"]).str.lower().isin(_yes)
     filtered["gender"] = _pick(["GENDER"])
     filtered["occasion"] = _pick(["OCCASION"])
     filtered["collection"] = _pick(["COLLECTION"])
@@ -402,8 +534,13 @@ def run_etl_pipeline(
     period_start: str = "",
     period_end: str = "",
     granularity: str = "monthly",
+    app_path: Optional[str] = None,
+    master_lookup_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, ETLStats]:
     """Execute the full multi-source ETL pipeline.
+
+    `master_lookup_df` (sku_code, title[, category, published]) lets a period upload
+    without a master CSV still resolve names and categories against the stored catalog.
 
     Returns (period_metrics_df, master_attributes_df, stats).
     """
@@ -414,6 +551,17 @@ def run_etl_pipeline(
         master_df, m_tot, m_excl = parse_master_csv(master_path)
     else:
         master_df, m_tot, m_excl = pd.DataFrame(columns=["sku_code"]), 0, 0
+
+    # Catalog used only for name/category lookups (never written back)
+    lookup_df = master_df
+    if lookup_df.empty and master_lookup_df is not None and not master_lookup_df.empty:
+        lookup_df = master_lookup_df.copy()
+        lookup_df["sku_code"] = lookup_df["sku_code"].map(normalize_sku)
+        title_src = "master_title" if "master_title" in lookup_df.columns else "title"
+        lookup_df["master_title"] = lookup_df.get(title_src, pd.Series("", index=lookup_df.index)).fillna("")
+        lookup_df["norm_title"] = lookup_df["master_title"].map(normalize_name)
+        if "base_sku_13" not in lookup_df.columns:
+            lookup_df["base_sku_13"] = lookup_df["sku_code"].map(to_base_sku_13)
     stats.master_total = m_tot
     stats.master_excluded = m_excl
     stats.master_skus = len(master_df)
@@ -438,7 +586,7 @@ def run_etl_pipeline(
 
     # Build lookup dicts for Perf 2-tier join
     known_skus: Set[str] = set()
-    for df in (web_df, oms_df, master_df):
+    for df in (web_df, oms_df, lookup_df):
         if not df.empty and "sku_code" in df.columns:
             known_skus.update(df["sku_code"].dropna().astype(str).tolist())
 
@@ -450,8 +598,8 @@ def run_etl_pipeline(
                 web_name_to_sku[nm] = row["sku_code"]
 
     master_name_to_sku: Dict[str, str] = {}
-    if not master_df.empty and "norm_title" in master_df.columns:
-        for _, row in master_df.iterrows():
+    if not lookup_df.empty and "norm_title" in lookup_df.columns:
+        for _, row in lookup_df.iterrows():
             nm = row.get("norm_title") or ""
             if nm and nm not in master_name_to_sku:
                 master_name_to_sku[nm] = row["sku_code"]
@@ -473,9 +621,22 @@ def run_etl_pipeline(
     stats.perf_purchased_unmatched_rows = p_purch_u
     stats.perf_skus = len(perf_df)
 
-    # 5. Union all period SKUs (Web + OMS + resolved Perf) — keep OOS SKUs too
+    # 4b. App CSV (names only -> attributed to SKUs via web names, then catalog titles)
+    if app_path:
+        app_df, app_stats = parse_app_csv(app_path, build_name_to_skus(web_df, lookup_df))
+    else:
+        app_df, app_stats = pd.DataFrame(columns=["sku_code"]), {}
+    stats.app_total = app_stats.get("total", 0)
+    stats.app_excluded = app_stats.get("excluded", 0)
+    stats.app_rows_matched = app_stats.get("matched", 0)
+    stats.app_purchased_rows = app_stats.get("purchased", 0)
+    stats.app_purchased_rows_matched = app_stats.get("purchased_matched", 0)
+    stats.app_skus = len(app_df)
+
+    # 5. Union all period SKUs (Web + App + OMS + resolved Perf) — keep OOS SKUs too
     period_df = pd.DataFrame({"sku_code": sorted(
         set(web_df.get("sku_code", pd.Series(dtype=str)))
+        | set(app_df.get("sku_code", pd.Series(dtype=str)))
         | set(oms_df.get("sku_code", pd.Series(dtype=str)))
         | set(perf_df.get("sku_code", pd.Series(dtype=str)))
     )})
@@ -483,6 +644,8 @@ def run_etl_pipeline(
 
     if not web_df.empty:
         period_df = period_df.merge(web_df, on="sku_code", how="left")
+    if not app_df.empty:
+        period_df = period_df.merge(app_df, on="sku_code", how="left")
     if not oms_df.empty:
         period_df = period_df.merge(oms_df, on="sku_code", how="left")
     if not perf_df.empty:
@@ -503,6 +666,7 @@ def run_etl_pipeline(
         "oms_revenue_ratio",
         "perf_users",
         "perf_units",
+        *APP_METRIC_COLS,
     ]
     for col in num_defaults:
         if col not in period_df.columns:
@@ -510,8 +674,23 @@ def run_etl_pipeline(
         else:
             period_df[col] = period_df[col].fillna(0.0)
 
+    # Units sold: OMS already contains web/app orders, so take the larger figure
+    # rather than adding them (adding would double count).
+    period_df["units_sold"] = np.maximum(
+        period_df["oms_units"], period_df["web_purchased"] + period_df["app_purchases"]
+    )
+    for col in ("web_category", "app_category", "price_band"):
+        if col not in period_df.columns:
+            period_df[col] = None
+
     if "product_name" not in period_df.columns:
         period_df["product_name"] = None
+    if "oms_product_name" in period_df.columns:
+        # OMS-only SKUs (no web/app traffic) still get a name, and so a category.
+        period_df["product_name"] = period_df["product_name"].where(
+            period_df["product_name"].notna() & (period_df["product_name"].astype(str).str.strip() != ""),
+            period_df["oms_product_name"],
+        )
     if "avg_price" not in period_df.columns:
         period_df["avg_price"] = np.nan
 
@@ -520,8 +699,8 @@ def run_etl_pipeline(
     master_13_map: Dict[str, Dict[str, Any]] = {}
     master_title_map: Dict[str, Dict[str, Any]] = {}
 
-    if not master_df.empty:
-        for _, mrow in master_df.iterrows():
+    if not lookup_df.empty:
+        for _, mrow in lookup_df.iterrows():
             rec = mrow.to_dict()
             code = rec["sku_code"]
             b13 = rec.get("base_sku_13") or ""
@@ -563,14 +742,23 @@ def run_etl_pipeline(
         match_tiers.append(tier)
         if mrec:
             resolved_titles.append(pname or mrec.get("master_title") or None)
-            resolved_categories.append(mrec.get("category") or prow.get("web_category") or None)
+            resolved_categories.append(
+                canonical_category(
+                    mrec.get("category"),
+                    prow.get("web_category"),
+                    prow.get("app_category"),
+                    name=pname or mrec.get("master_title"),
+                )
+            )
             combined_row = dict(mrec)
             if pname:
                 combined_row["Product Name"] = pname
             resolved_dna.append(extract_design_dna(combined_row))
         else:
             resolved_titles.append(pname or None)
-            resolved_categories.append(prow.get("web_category") or None)
+            resolved_categories.append(
+                canonical_category(prow.get("web_category"), prow.get("app_category"), name=pname)
+            )
             resolved_dna.append(extract_design_dna({"Product Name": pname or ""}))
 
     period_df["master_match_tier"] = match_tiers
@@ -589,13 +777,21 @@ def run_etl_pipeline(
             "master_title",
             "category",
             "product_type",
+            "metal",
             "metal_color",
             "karatage",
+            "diamond_clarity",
+            "weight_band",
             "gender",
             "occasion",
             "collection",
             "design",
             "styling",
+            "published",
+            "is_new_collection",
+            "is_best_deal",
+            "short_description",
+            "long_description",
             "image_url",
             "design_tags",
         ]
@@ -629,6 +825,13 @@ SKU_PERIOD_METRICS_COLS = (
     "perf_users",
     "perf_units",
     "match_tier",
+    "price_band",
+    "app_clicks",
+    "app_views",
+    "app_atc",
+    "app_purchases",
+    "app_revenue",
+    "units_sold",
 )
 
 SKU_MASTER_ATTRIBUTES_COLS = (
@@ -652,6 +855,8 @@ SKU_MASTER_ATTRIBUTES_COLS = (
     "long_description",
     "design_tags",
     "image_url",
+    "gender",
+    "published",
 )
 
 
@@ -672,6 +877,13 @@ _PERIOD_FLOAT_DECIMALS = {
     "web_conv_rate": 6,
     "web_cart_abandon_rate": 6,
     "oms_rev_share": 8,
+    # App rows shared by several SKUs are split by weight, so these can be fractional.
+    "app_clicks": 2,
+    "app_views": 2,
+    "app_atc": 2,
+    "app_purchases": 2,
+    "app_revenue": 2,
+    "units_sold": 2,
 }
 
 
@@ -691,8 +903,27 @@ def _dedupe_records(records: List[Dict[str, Any]], key_cols: Tuple[str, ...]) ->
     return list(deduped.values())
 
 
-def prepare_period_metrics_records(period_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Map, cast, deduplicate, and filter period_df rows to exact sku_period_metrics SQL columns."""
+_SOURCE_PERIOD_COLS = {
+    "web": {"web_clicks", "web_views", "web_atc", "web_purchases", "web_revenue", "web_atc_rate",
+            "web_conv_rate", "web_cart_abandon_rate", "avg_price", "price_band", "product_name", "category", "match_tier"},
+    "app": {"app_clicks", "app_views", "app_atc", "app_purchases", "app_revenue"},
+    "oms": {"oms_units", "oms_revenue_inr", "oms_rev_share"},
+    "perf": {"perf_users", "perf_units"},
+}
+_PERIOD_KEY_COLS = {"sku_code", "period_start", "period_end", "granularity"}
+
+
+def prepare_period_metrics_records(
+    period_df: pd.DataFrame,
+    sources: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Map, cast, deduplicate, and filter period_df rows to exact sku_period_metrics SQL columns.
+
+    With `sources`, only columns owned by those sources are written, so a partial upload
+    for a period does not overwrite other sources' stored values with zeros. `units_sold`
+    is only written when Web, App and OMS are all present (it needs all three); the model
+    recomputes it from stored columns anyway.
+    """
     if period_df.empty:
         return []
     df = period_df.rename(
@@ -704,7 +935,14 @@ def prepare_period_metrics_records(period_df: pd.DataFrame) -> List[Dict[str, An
         }
     )
     allowed = set(SKU_PERIOD_METRICS_COLS)
-    cols = [c for c in SKU_PERIOD_METRICS_COLS if c in df.columns]
+    if sources is not None:
+        owned = set(_PERIOD_KEY_COLS)
+        for src in sources:
+            owned |= _SOURCE_PERIOD_COLS.get(src, set())
+        if {"web", "app", "oms"} <= set(sources):
+            owned.add("units_sold")
+        allowed &= owned
+    cols = [c for c in SKU_PERIOD_METRICS_COLS if c in df.columns and c in allowed]
     records = df[cols].where(pd.notnull(df[cols]), None).to_dict(orient="records")
     cleaned: List[Dict[str, Any]] = []
     for r in records:

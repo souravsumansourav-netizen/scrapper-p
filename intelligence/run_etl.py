@@ -61,7 +61,14 @@ def _compute_top_tags_by_weighted_atc(period_df: pd.DataFrame, top_n: int = 10) 
 def _print_audit_summary(period_df: pd.DataFrame, stats: ETLStats) -> None:
     print("\n=== SKU Intelligence ETL Audit Summary ===")
     print(f"Web CSV    : {stats.web_total} rows | {stats.web_excluded} excluded | {stats.web_skus} jewellery SKUs")
+    print(
+        f"App CSV    : {stats.app_total} rows | {stats.app_excluded} excluded | "
+        f"name-matched rows {stats.app_rows_matched} | purchased rows matched "
+        f"{stats.app_purchased_rows_matched}/{stats.app_purchased_rows} | {stats.app_skus} SKUs"
+    )
     print(f"OMS CSV    : {stats.oms_total} rows | {stats.oms_excluded} excluded | {stats.oms_skus} jewellery SKUs")
+    if "units_sold" in period_df.columns:
+        print(f"Units sold : {int((period_df['units_sold'] > 0).sum())} SKUs sold at least 1 unit")
     print(
         f"Perf CSV   : {stats.perf_total} rows | {stats.perf_excluded} excluded | "
         f"overall join {stats.perf_join_rate:.2f}% ({stats.perf_matched_rows}/{stats.perf_matched_rows + stats.perf_unmatched_rows}) | "
@@ -130,6 +137,7 @@ def _push_to_supabase(period_df: pd.DataFrame, master_attrs_df: pd.DataFrame) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run SKU Intelligence multi-source ETL.")
     parser.add_argument("--web", type=str, default=None, help="Path to Web CSV (web-data-*.csv)")
+    parser.add_argument("--app", type=str, default=None, help="Path to App CSV (app-data-*.csv)")
     parser.add_argument("--oms", type=str, default=None, help="Path to OMS CSV")
     parser.add_argument("--perf", type=str, default=None, help="Path to GA4 Perf CSV")
     parser.add_argument("--master", type=str, default=None, help="Path to Master Enrichment CSV")
@@ -140,11 +148,12 @@ def main() -> None:
     parser.add_argument("--push-supabase", action="store_true", help="Batch-upsert outputs to Supabase.")
     args = parser.parse_args()
 
-    if not any([args.web, args.oms, args.perf, args.master]):
-        print("At least one input CSV (--web, --oms, --perf, --master) is required.", file=sys.stderr)
+    if not any([args.web, args.app, args.oms, args.perf, args.master]):
+        print("At least one input CSV (--web, --app, --oms, --perf, --master) is required.", file=sys.stderr)
         sys.exit(1)
 
     period_df, master_attrs_df, stats = run_etl_pipeline(
+        app_path=args.app,
         web_path=args.web,
         oms_path=args.oms,
         perf_path=args.perf,

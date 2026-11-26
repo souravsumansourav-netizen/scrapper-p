@@ -1,3 +1,14 @@
+"""Category-winner model (Phase 1).
+
+Label: a SKU is a winner when it is in the top 20% of *selling* SKUs in its
+category by units sold, and sold at least 2 units. Units sold =
+max(OMS units, web + app purchases).
+
+Phase 1 uses one period, so the model learns "which SKUs look like this month's
+winners" from traffic, intent, price and design — not purchases. Every SKU is
+scored by a model that never saw it (5-fold out-of-fold), then calibrated.
+Phase 2 will switch to forecasting next month once several months are loaded.
+"""
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -5,296 +16,244 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from intelligence.features import STRUCTURED_CAT_COLS, build_feature_matrix
+from intelligence.features import CAT_FEATURES, PRICE_BAND_LABEL, build_feature_frame
 
-BASE_BEHAVIORAL_FEATURES = [
-    "total_views",
-    "log_views",
-    "total_clicks",
-    "total_atc",
-    "smoothed_atc_rate",
-    "click_to_view_ratio",
-    "avg_price",
-    "price_pct_in_category",
-    "trend_3m",
-]
+MODEL_VERSION = "lgbm_v2_category_winner"
 
-MULTI_PERIOD_EXTRA_FEATURES = [
-    "cart_abandon_rate",
-    "repeat_seller_periods",
-]
+WINNER_TOP_SHARE = 0.20
+WINNER_MIN_UNITS = 2.0
+
+GEM_MIN_VIEWS = 50.0  # enough traffic that the add-to-cart rate is not luck
+GEM_MIN_ATC = 5.0
+GEM_MAX_TRAFFIC_PCT = 0.50  # at or below the category median traffic (among viewed SKUs)
+GEM_MIN_ATC_RATE_PCT = 0.90  # top 10% add-to-cart rate in its category
+GEM_MIN_CATEGORY_VIEWED = 30  # "below median traffic" means little in a tiny category
+
+WATCHLIST_MIN_PROB = 0.30
 
 
-def get_feature_columns(feat_df: pd.DataFrame, is_multi_period: bool) -> List[str]:
-    """Return leakage-free feature column list."""
-    cols = list(BASE_BEHAVIORAL_FEATURES)
-    if is_multi_period:
-        cols.extend(MULTI_PERIOD_EXTRA_FEATURES)
-    cols.extend([c for c in STRUCTURED_CAT_COLS if c in feat_df.columns])
-    cols.extend([c for c in feat_df.columns if c.startswith("dna_")])
-    cols.extend([c for c in feat_df.columns if c.startswith("svd_")])
-    return cols
+def label_winners(df: pd.DataFrame) -> pd.Series:
+    """Top 20% of selling SKUs in each category by units, with at least 2 units."""
+    units = df["units_sold"].astype(float)
+    sellers = units >= 1
+    thresholds = df[sellers].groupby("category", observed=True)["units_sold"].quantile(1.0 - WINNER_TOP_SHARE)
+    cutoff = df["category"].astype(str).map(thresholds.rename(index=str)).fillna(np.inf)
+    return (units >= np.maximum(cutoff, WINNER_MIN_UNITS)).astype(int)
 
 
-def _fit_lgbm_binary(X: pd.DataFrame, y: np.ndarray) -> lgb.LGBMClassifier:
+def _fit_lgbm(X: pd.DataFrame, y: np.ndarray) -> lgb.LGBMClassifier:
     model = lgb.LGBMClassifier(
-        n_estimators=200,
-        learning_rate=0.05,
+        n_estimators=300,
+        learning_rate=0.04,
         num_leaves=31,
-        subsample_for_bin=50000,
-        class_weight="balanced",
+        min_child_samples=20,
+        subsample=0.9,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
         random_state=42,
         n_jobs=-1,
         verbose=-1,
     )
-    model.fit(X, y)
+    model.fit(X, y, categorical_feature=[c for c in CAT_FEATURES if c in X.columns])
     return model
 
 
-def _cv_oof_and_calibrated(
-    X: pd.DataFrame,
-    y: np.ndarray,
-    n_splits: int = 5,
-) -> Tuple[np.ndarray, float, lgb.LGBMClassifier]:
-    """Run 5-fold Stratified CV, calibrate OOF probabilities, and fit full model for explainability."""
-    n_pos = int(y.sum())
-    n_neg = int(len(y) - n_pos)
-    actual_splits = min(n_splits, n_pos, n_neg)
-
-    if actual_splits < 2:
-        full_model = _fit_lgbm_binary(X, y)
-        probs = full_model.predict_proba(X)[:, 1]
-        return probs, 0.5, full_model
-
-    skf = StratifiedKFold(n_splits=actual_splits, shuffle=True, random_state=42)
-    oof_raw = np.zeros(len(y), dtype=float)
-
-    for train_idx, val_idx in skf.split(X, y):
-        clf = _fit_lgbm_binary(X.iloc[train_idx], y[train_idx])
-        oof_raw[val_idx] = clf.predict_proba(X.iloc[val_idx])[:, 1]
-
-    auc = float(roc_auc_score(y, oof_raw))
-    iso = IsotonicRegression(out_of_bounds="clip")
-    oof_cal = iso.fit_transform(oof_raw, y)
-
-    full_model = _fit_lgbm_binary(X, y)
-    return oof_cal, round(auc, 4), full_model
+def _oof_calibrated(X: pd.DataFrame, y: np.ndarray, n_splits: int = 5) -> Tuple[np.ndarray, np.ndarray, lgb.LGBMClassifier]:
+    """Out-of-fold raw + isotonic-calibrated probabilities, and a full-data model for explanations."""
+    splits = min(n_splits, int(y.sum()), int(len(y) - y.sum()))
+    full_model = _fit_lgbm(X, y)
+    if splits < 2:
+        raw = full_model.predict_proba(X)[:, 1]
+        return raw, raw, full_model
+    oof = np.zeros(len(y))
+    for tr, va in StratifiedKFold(n_splits=splits, shuffle=True, random_state=42).split(X, y):
+        oof[va] = _fit_lgbm(X.iloc[tr], y[tr]).predict_proba(X.iloc[va])[:, 1]
+    calibrated = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit_transform(oof, y)
+    return oof, calibrated, full_model
 
 
-def _format_driver(feat_name: str, contrib: float, row: pd.Series) -> str:
-    sign = "+" if contrib >= 0 else "-"
-
-    if feat_name == "smoothed_atc_rate":
-        pct = float(row.get("smoothed_atc_rate", 0.0)) * 100.0
-        qual = "High" if contrib >= 0 else "Low"
-        return f"{sign} {qual} Smoothed ATC ({pct:.1f}%)"
-    if feat_name in ("total_views", "log_views"):
-        views = int(row.get("total_views", 0))
-        qual = "Strong" if contrib >= 0 else "Low"
-        return f"{sign} {qual} Views ({views})"
-    if feat_name == "total_atc":
-        atc = int(row.get("total_atc", 0))
-        qual = "High" if contrib >= 0 else "Low"
-        return f"{sign} {qual} ATC ({atc})"
-    if feat_name == "price_pct_in_category":
-        pct = int(round(float(row.get("price_pct_in_category", 0.5)) * 100))
-        qual = "High" if contrib >= 0 else "Lower"
-        return f"{sign} {qual} Price Percentile ({pct}%)"
-    if feat_name == "avg_price":
-        price = float(row.get("avg_price", 0.0))
-        return f"{sign} Price (INR {price:,.0f})"
-    if feat_name == "click_to_view_ratio":
-        ctr = float(row.get("click_to_view_ratio", 0.0)) * 100.0
-        return f"{sign} Click/View ({ctr:.1f}%)"
-    if feat_name == "category":
-        return f"{sign} Category: {row.get('category', 'unknown')}"
-    if feat_name.startswith("dna_"):
-        parts = feat_name.split("_", 2)
-        axis = parts[1].capitalize() if len(parts) > 1 else "DNA"
-        term = parts[2].replace("_", " ").title() if len(parts) > 2 else feat_name
-        return f"{sign} {axis}: {term}"
-    if feat_name.startswith("svd_"):
-        return f"{sign} Description Theme ({feat_name.upper()})"
-    if feat_name in STRUCTURED_CAT_COLS:
-        label = feat_name.replace("_", " ").title()
-        return f"{sign} {label}: {row.get(feat_name, 'unknown')}"
-
-    pretty = re.sub(r"_+", " ", feat_name).title()
-    return f"{sign} {pretty}"
+# ---------------------------------------------------------------- drivers
+_DRIVER_LABELS = {
+    "log_views_total": "Views",
+    "log_views_web": "Web views",
+    "log_views_app": "App views",
+    "log_clicks_total": "Listing clicks",
+    "log_atc_total": "Add-to-carts",
+}
 
 
-def _extract_top_drivers(
-    model: lgb.LGBMClassifier,
-    X: pd.DataFrame,
-    feat_df: pd.DataFrame,
-    top_k: int = 4,
-) -> List[List[str]]:
-    """Use LightGBM native pred_contrib=True to extract top K drivers per SKU."""
-    contribs = model.predict(X, pred_contrib=True)
-    feat_names = list(X.columns)
-    all_drivers: List[List[str]] = []
-
-    for idx in range(len(X)):
-        row_contrib = contribs[idx, :-1]  # exclude trailing bias column
-        top_indices = np.argsort(np.abs(row_contrib))[::-1][:top_k]
-        row_series = feat_df.iloc[idx]
-        drivers = [
-            _format_driver(feat_names[j], float(row_contrib[j]), row_series)
-            for j in top_indices
-        ]
-        all_drivers.append(drivers)
-
-    return all_drivers
+def _pct(v: Any) -> str:
+    return "—" if v is None or pd.isna(v) else f"{float(v) * 100:.1f}%"
 
 
-def _assign_tier(row: pd.Series) -> str:
-    perf_u = float(row["perf_units"])
-    oms_u = float(row["oms_units"])
-    p_perf = float(row["perf_sell_prob"])
-    b_score = float(row["breakout_score"])
+def _top_share(v: Any) -> str:
+    if v is None or pd.isna(v):
+        return "no data"
+    return f"top {max(1, round((1 - float(v)) * 100))}%"
 
-    if perf_u >= 1 or (p_perf >= 0.65 and oms_u >= 2):
-        return "Proven Winner"
-    if perf_u == 0 and b_score >= 97.0:
-        return "Hidden Gem"
-    if (perf_u == 0 and b_score >= 85.0) or p_perf >= 0.35:
-        return "Watchlist"
-    return "Low Potential"
+
+def _driver_text(feat: str, row: pd.Series) -> str:
+    if feat in _DRIVER_LABELS:
+        raw = {"log_views_total": "views_total", "log_views_web": "web_views", "log_views_app": "app_views",
+               "log_clicks_total": "clicks_total", "log_atc_total": "atc_total"}[feat]
+        return f"{_DRIVER_LABELS[feat]} {int(round(float(row.get(raw, 0) or 0))):,}"
+    if feat == "atc_rate_smoothed":
+        return f"Add-to-cart rate {_pct(row.get(feat))}"
+    if feat == "atc_rate_pct_cat":
+        return f"Add-to-cart rate {_top_share(row.get(feat))} of category"
+    if feat == "views_pct_cat":
+        return f"Traffic {_top_share(row.get(feat))} of category"
+    if feat == "app_view_share":
+        return f"App share of views {_pct(row.get(feat))}"
+    if feat == "click_through":
+        return f"Click-through {_pct(row.get(feat))}"
+    if feat == "price_band_ord":
+        v = row.get(feat)
+        return f"Price band {PRICE_BAND_LABEL.get(int(v), '?') if pd.notna(v) else 'unknown'}"
+    if feat == "price_pct_cat":
+        v = row.get(feat)
+        if pd.isna(v):
+            return "Price unknown"
+        return "Lower-priced for its category" if float(v) < 0.5 else "Higher-priced for its category"
+    if feat.startswith("dna_"):
+        _, axis, term = feat.split("_", 2)
+        return f"{axis.capitalize()}: {term.replace('_', ' ')}"
+    if feat in CAT_FEATURES:
+        return f"{feat.replace('_', ' ').capitalize()}: {row.get(feat)}"
+    return re.sub(r"_+", " ", feat).capitalize()
+
+
+def _top_drivers(model: lgb.LGBMClassifier, X: pd.DataFrame, frame: pd.DataFrame, k: int = 4) -> List[List[str]]:
+    contribs = model.predict(X, pred_contrib=True)[:, :-1]
+    names = list(X.columns)
+    out = []
+    for i in range(len(X)):
+        row = frame.iloc[i]
+        picked: List[str] = []
+        for j in np.argsort(np.abs(contribs[i]))[::-1]:
+            if len(picked) == k or abs(contribs[i, j]) < 1e-6:
+                break
+            if names[j] in CAT_FEATURES and str(row.get(names[j])) in {"unknown", "no"}:
+                continue  # "Occasion: unknown" explains nothing to a merchandiser
+            picked.append(f"{'↑' if contribs[i, j] >= 0 else '↓'} {_driver_text(names[j], row)}")
+        out.append(picked)
+    return out
+
+
+# ---------------------------------------------------------------- tiers
+def assign_tiers(df: pd.DataFrame) -> pd.Series:
+    viewed_in_cat = df.assign(_v=df["views_total"] > 0).groupby("category", observed=True)["_v"].transform("sum")
+    gem = (
+        (df["is_winner"] == 0)
+        & (viewed_in_cat >= GEM_MIN_CATEGORY_VIEWED)
+        & (df["views_total"] >= GEM_MIN_VIEWS)
+        & (df["atc_total"] >= GEM_MIN_ATC)
+        & (df["views_pct_cat_viewed"] <= GEM_MAX_TRAFFIC_PCT)
+        & (df["atc_rate_pct_cat"] >= GEM_MIN_ATC_RATE_PCT)
+    )
+    tier = np.where(
+        df["is_winner"] == 1, "Proven Winner",
+        np.where(gem, "Hidden Gem",
+                 np.where(df["winner_prob"] >= WATCHLIST_MIN_PROB, "Watchlist", "Low Potential")),
+    )
+    return pd.Series(tier, index=df.index)
+
+
+def _precision_at_k(df: pd.DataFrame, k: int = 10) -> Dict[str, Dict[str, Any]]:
+    out = {}
+    for cat, grp in df.groupby("category", observed=True):
+        n_win = int(grp["is_winner"].sum())
+        if n_win == 0:
+            continue
+        top = grp.nlargest(min(k, len(grp)), "winner_prob")
+        out[str(cat)] = {
+            "skus": int(len(grp)),
+            "winners": n_win,
+            "hits_in_top_k": int(top["is_winner"].sum()),
+            "k": int(len(top)),
+        }
+    return out
 
 
 def train_and_score(
     period_df: pd.DataFrame,
     master_df: Optional[pd.DataFrame] = None,
+    market_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Train dual LightGBM models, compute breakout scores, tiers, and top_drivers."""
-    periods = sorted(period_df["period_start"].dropna().astype(str).unique()) if "period_start" in period_df.columns else ["single"]
-    is_multi_period = len(periods) >= 2
+    frame, feat_cols = build_feature_frame(period_df, master_df, market_df)
+    frame = frame.reset_index(drop=True)
+    frame["is_winner"] = label_winners(frame)
+    y = frame["is_winner"].to_numpy()
+    X = frame[feat_cols]
 
-    if is_multi_period:
-        latest_period = periods[-1]
-        hist_period_df = period_df[period_df["period_start"].astype(str) != latest_period].copy()
-        latest_targets = (
-            period_df[period_df["period_start"].astype(str) == latest_period]
-            .groupby("sku_code", as_index=False)[["perf_units", "oms_units"]]
-            .sum()
+    oof_raw, prob, model = _oof_calibrated(X, y)
+    frame["winner_prob"] = prob
+    frame["_rank_score"] = oof_raw  # finer-grained than isotonic steps, for ranking
+
+    frame["category_size"] = frame.groupby("category", observed=True)["sku_code"].transform("count")
+    frame["category_rank"] = frame.groupby("category", observed=True)["_rank_score"].rank(ascending=False, method="first")
+    frame["category_pct"] = frame.groupby("category", observed=True)["_rank_score"].rank(pct=True) * 100.0
+    gem_score = frame["atc_rate_pct_cat"] * 100.0
+    frame["gem_score"] = gem_score.where(frame["views_total"] > 0)
+    frame["tier"] = assign_tiers(frame)
+    drivers = _top_drivers(model, X, frame)
+    # Hidden Gems are chosen by a rule, not the winner model, so lead with the rule's reason.
+    for i in np.flatnonzero(frame["tier"].to_numpy() == "Hidden Gem"):
+        r = frame.iloc[i]
+        reason = (
+            f"★ Add-to-cart rate {_top_share(r['atc_rate_pct_cat'])} of category "
+            f"on below-median traffic ({int(r['views_total']):,} views)"
         )
-        oot_feat, text_pipe, _ = build_feature_matrix(hist_period_df, master_df, fit_text=True)
-        oot_merged = oot_feat.merge(
-            latest_targets.rename(columns={"perf_units": "_t_perf", "oms_units": "_t_oms"}),
-            on="sku_code",
-            how="left",
-        )
-        oot_merged["_t_perf"] = oot_merged["_t_perf"].fillna(0.0)
-        oot_merged["_t_oms"] = oot_merged["_t_oms"].fillna(0.0)
+        drivers[i] = [reason] + drivers[i][:3]
 
-        oot_cols = get_feature_columns(oot_merged, is_multi_period=True)
-        X_oot = oot_merged[oot_cols]
-        y_oot_perf = (oot_merged["_t_perf"] >= 1).astype(int).to_numpy()
-        y_oot_oms = (oot_merged["_t_oms"] >= 1).astype(int).to_numpy()
+    snap_cols = ["product_name", "views_total", "web_views", "app_views", "atc_total", "atc_rate_smoothed",
+                 "units_sold", "oms_units", "price_band", "live_price"]
+    snapshots = []
+    for _, r in frame.iterrows():
+        snap = {}
+        for c in snap_cols:
+            v = r.get(c)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            snap[c] = round(float(v), 4) if isinstance(v, (int, float, np.floating, np.integer)) else str(v)
+        snapshots.append(snap)
 
-        _, perf_auc, _ = _cv_oof_and_calibrated(X_oot, y_oot_perf)
-        _, oms_auc, _ = _cv_oof_and_calibrated(X_oot, y_oot_oms)
-
-        # Refit on all periods to score forward
-        feat_df, _, _ = build_feature_matrix(period_df, master_df, text_pipeline=text_pipe, fit_text=False)
-        feat_cols = get_feature_columns(feat_df, is_multi_period=True)
-        X_all = feat_df[feat_cols]
-        y_perf = (feat_df["perf_units"] >= 1).astype(int).to_numpy()
-        y_oms = (feat_df["oms_units"] >= 1).astype(int).to_numpy()
-        perf_probs, _, perf_model = _cv_oof_and_calibrated(X_all, y_perf)
-        oms_probs, _, _ = _cv_oof_and_calibrated(X_all, y_oms)
-    else:
-        feat_df, _, _ = build_feature_matrix(period_df, master_df, fit_text=True)
-        feat_cols = get_feature_columns(feat_df, is_multi_period=False)
-        X_all = feat_df[feat_cols]
-        y_perf = (feat_df["perf_units"] >= 1).astype(int).to_numpy()
-        y_oms = (feat_df["oms_units"] >= 1).astype(int).to_numpy()
-
-        perf_probs, perf_auc, perf_model = _cv_oof_and_calibrated(X_all, y_perf)
-        oms_probs, oms_auc, _ = _cv_oof_and_calibrated(X_all, y_oms)
-
-    # Breakout / Potential Top Seller Score (0-100)
-    views_pct = feat_df["total_views"].rank(pct=True).to_numpy()
-    traffic_headroom = np.clip(1.0 - views_pct, 0.15, 1.0)
-    atc_pct = feat_df["smoothed_atc_rate"].rank(pct=True).to_numpy()
-
-    intent_signal = 0.5 * perf_probs + 0.3 * oms_probs + 0.2 * atc_pct
-    raw_breakout = 100.0 * intent_signal * (0.4 + 0.6 * traffic_headroom)
-    unscaled_mask = feat_df["perf_units"].to_numpy() == 0
-    raw_breakout = raw_breakout + np.where(unscaled_mask, 5.0, 0.0)
-
-    # Percentile-rank scale cleanly to 0.00-100.00 across unscaled SKUs (perf_units == 0),
-    # and map scaled SKUs onto the exact same 0-100 distribution.
-    breakout_score = np.zeros(len(feat_df), dtype=float)
-    if unscaled_mask.any():
-        unscaled_raw = raw_breakout[unscaled_mask]
-        unscaled_pct = pd.Series(unscaled_raw).rank(pct=True).to_numpy() * 100.0
-        breakout_score[unscaled_mask] = unscaled_pct
-
-        if (~unscaled_mask).any():
-            sorted_u = np.sort(unscaled_raw)
-            grid = np.linspace(0.0, 100.0, len(sorted_u))
-            breakout_score[~unscaled_mask] = np.interp(raw_breakout[~unscaled_mask], sorted_u, grid)
-    else:
-        breakout_score = pd.Series(raw_breakout).rank(pct=True).to_numpy() * 100.0
-
-    breakout_score = np.round(np.clip(breakout_score, 0.0, 100.0), 2)
-
-    top_drivers = _extract_top_drivers(perf_model, X_all, feat_df, top_k=4)
-
-    design_tags_col = feat_df.get("design_tags", pd.Series([{} for _ in range(len(feat_df))], index=feat_df.index))
-    parsed_design_tags = [
-        v if isinstance(v, dict) else {}
-        for v in design_tags_col
-    ]
-
-    feature_snapshots = [
-        {
-            "product_name": None if pd.isna(r.get("product_name")) else r.get("product_name"),
-            "category": str(r.get("category", "unknown")),
-            "avg_price": round(float(r.get("avg_price", 0.0)), 2),
-            "total_views": int(r.get("total_views", 0)),
-            "total_atc": int(r.get("total_atc", 0)),
-            "smoothed_atc_rate": round(float(r.get("smoothed_atc_rate", 0.0)), 4),
-            "perf_units": int(r.get("perf_units", 0)),
-            "oms_units": int(r.get("oms_units", 0)),
-        }
-        for _, r in feat_df.iterrows()
-    ]
-
-    scored = pd.DataFrame(
-        {
-            "sku_code": feat_df["sku_code"],
-            "product_name": feat_df["product_name"],
-            "category": feat_df["category"].astype(str),
-            "avg_price": np.round(feat_df["avg_price"], 2),
-            "total_views": feat_df["total_views"].astype(int),
-            "total_atc": feat_df["total_atc"].astype(int),
-            "smoothed_atc_rate": np.round(feat_df["smoothed_atc_rate"], 4),
-            "perf_units": feat_df["perf_units"].astype(int),
-            "oms_units": feat_df["oms_units"].astype(int),
-            "perf_sell_prob": np.round(perf_probs, 4),
-            "oms_sell_prob": np.round(oms_probs, 4),
-            "breakout_score": breakout_score,
-            "trend_3m": np.round(feat_df["trend_3m"], 4),
-            "top_drivers": top_drivers,
-            "design_tags": parsed_design_tags,
-            "feature_snapshot": feature_snapshots,
-            "model_version": "lgbm_v1",
-        }
-    )
-    scored["tier"] = scored.apply(_assign_tier, axis=1)
+    scored = pd.DataFrame({
+        "sku_code": frame["sku_code"],
+        "product_name": frame["product_name"],
+        "category": frame["category"].astype(str),
+        "winner_prob": np.round(frame["winner_prob"], 4),
+        "category_rank": frame["category_rank"].astype(int),
+        "category_size": frame["category_size"].astype(int),
+        "category_pct": np.round(frame["category_pct"], 2),
+        "breakout_score": np.round(frame["category_pct"], 2),  # kept for older dashboard builds
+        "units_sold": np.round(frame["units_sold"], 2),
+        "gem_score": np.round(frame["gem_score"], 2),
+        "tier": frame["tier"],
+        "is_winner": frame["is_winner"],
+        "views_total": np.round(frame["views_total"], 0),
+        "atc_total": np.round(frame["atc_total"], 0),
+        "atc_rate_smoothed": np.round(frame["atc_rate_smoothed"], 4),
+        "stock_status": frame["stock_status"],
+        "top_drivers": drivers,
+        "design_tags": frame["design_tags"],
+        "feature_snapshot": snapshots,
+        "model_version": MODEL_VERSION,
+    })
 
     metrics = {
-        "n_skus": len(scored),
-        "n_periods": len(periods),
-        "validation_mode": "out_of_time" if is_multi_period else "5fold_stratified_cv",
-        "perf_roc_auc": perf_auc,
-        "oms_roc_auc": oms_auc,
+        "n_skus": int(len(scored)),
+        "n_features": len(feat_cols),
+        "n_winners": int(y.sum()),
+        "base_rate": round(float(y.mean()), 4),
+        "roc_auc": round(float(roc_auc_score(y, oof_raw)), 4) if 0 < y.sum() < len(y) else None,
+        "avg_precision": round(float(average_precision_score(y, oof_raw)), 4) if y.sum() else None,
         "tier_counts": scored["tier"].value_counts().to_dict(),
+        "precision_at_10": _precision_at_k(frame.assign(winner_prob=oof_raw)),
+        "validation_mode": "5fold_out_of_fold_same_period",
     }
     return scored, metrics
-

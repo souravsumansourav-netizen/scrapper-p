@@ -3,9 +3,9 @@ from typing import Iterable, Optional, Tuple
 
 import pandas as pd
 
-NON_JEWELLERY_SKU_PREFIXES = ("600", "800", "EGC")
+NON_JEWELLERY_SKU_PREFIXES = ("600", "800", "EGC", "AMOUNTGC")
 NON_JEWELLERY_TEXT_RE = re.compile(
-    r"\b(?:coin|coins|bar|bars|bullion|gift\s*card|e-gift|egc|voucher)\b",
+    r"\b(?:coin|coins|bar|bars|bullion|gift\s*card|e-gift|egc|voucher)\b|^amount:",
     re.IGNORECASE,
 )
 
