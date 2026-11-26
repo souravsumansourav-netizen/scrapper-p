@@ -655,6 +655,26 @@ SKU_MASTER_ATTRIBUTES_COLS = (
 )
 
 
+_PERIOD_INT_COLS = {
+    "web_clicks",
+    "web_views",
+    "web_atc",
+    "web_purchases",
+    "oms_units",
+    "perf_users",
+    "perf_units",
+}
+_PERIOD_FLOAT_DECIMALS = {
+    "avg_price": 2,
+    "web_revenue": 2,
+    "oms_revenue_inr": 2,
+    "web_atc_rate": 6,
+    "web_conv_rate": 6,
+    "web_cart_abandon_rate": 6,
+    "oms_rev_share": 8,
+}
+
+
 def _clean_record_nans(rec: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in list(rec.items()):
         if isinstance(v, float) and pd.isna(v):
@@ -662,8 +682,17 @@ def _clean_record_nans(rec: Dict[str, Any]) -> Dict[str, Any]:
     return rec
 
 
+def _dedupe_records(records: List[Dict[str, Any]], key_cols: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """Deduplicate records on conflict key (last write wins) to avoid batch duplicate-key errors."""
+    deduped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for rec in records:
+        key = tuple(rec.get(k) for k in key_cols)
+        deduped[key] = rec
+    return list(deduped.values())
+
+
 def prepare_period_metrics_records(period_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Map and filter period_df rows to the exact sku_period_metrics SQL columns."""
+    """Map, cast, deduplicate, and filter period_df rows to exact sku_period_metrics SQL columns."""
     if period_df.empty:
         return []
     df = period_df.rename(
@@ -677,11 +706,21 @@ def prepare_period_metrics_records(period_df: pd.DataFrame) -> List[Dict[str, An
     allowed = set(SKU_PERIOD_METRICS_COLS)
     cols = [c for c in SKU_PERIOD_METRICS_COLS if c in df.columns]
     records = df[cols].where(pd.notnull(df[cols]), None).to_dict(orient="records")
-    return [_clean_record_nans({k: v for k, v in r.items() if k in allowed}) for r in records]
+    cleaned: List[Dict[str, Any]] = []
+    for r in records:
+        rec = _clean_record_nans({k: v for k, v in r.items() if k in allowed})
+        for col in _PERIOD_INT_COLS:
+            if col in rec and rec[col] is not None:
+                rec[col] = int(round(float(rec[col])))
+        for col, dec in _PERIOD_FLOAT_DECIMALS.items():
+            if col in rec and rec[col] is not None:
+                rec[col] = round(float(rec[col]), dec)
+        cleaned.append(rec)
+    return _dedupe_records(cleaned, ("sku_code", "period_start", "period_end"))
 
 
 def prepare_master_attribute_records(master_attrs_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Map and filter master_attrs_df rows to the exact sku_master_attributes SQL columns."""
+    """Map, deduplicate, and filter master_attrs_df rows to exact sku_master_attributes SQL columns."""
     if master_attrs_df.empty:
         return []
     df = master_attrs_df.rename(
@@ -694,6 +733,7 @@ def prepare_master_attribute_records(master_attrs_df: pd.DataFrame) -> List[Dict
     allowed = set(SKU_MASTER_ATTRIBUTES_COLS)
     cols = [c for c in SKU_MASTER_ATTRIBUTES_COLS if c in df.columns]
     records = df[cols].where(pd.notnull(df[cols]), None).to_dict(orient="records")
-    return [_clean_record_nans({k: v for k, v in r.items() if k in allowed}) for r in records]
+    cleaned = [_clean_record_nans({k: v for k, v in r.items() if k in allowed}) for r in records]
+    return _dedupe_records(cleaned, ("sku_code",))
 
 

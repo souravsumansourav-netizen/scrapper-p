@@ -177,7 +177,7 @@ def _process_group(
                 for i in range(0, len(period_records), batch_size):
                     client.table("sku_period_metrics").upsert(
                         period_records[i : i + batch_size],
-                        on_conflict="sku_code,period_start,period_end,granularity",
+                        on_conflict="sku_code,period_start,period_end",
                     ).execute()
 
             match_pct = round(100.0 - stats.master_match_pct()["unmatched"], 2) if stats.period_skus > 0 else None

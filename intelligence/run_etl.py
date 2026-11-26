@@ -122,7 +122,7 @@ def _push_to_supabase(period_df: pd.DataFrame, master_attrs_df: pd.DataFrame) ->
         chunk = period_records[i : i + batch_size]
         client.table("sku_period_metrics").upsert(
             chunk,
-            on_conflict="sku_code,period_start,period_end,granularity",
+            on_conflict="sku_code,period_start,period_end",
         ).execute()
     print(f"Upserted {len(period_records)} rows into sku_period_metrics.")
 

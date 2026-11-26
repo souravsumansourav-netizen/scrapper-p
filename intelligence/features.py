@@ -72,6 +72,8 @@ def build_feature_matrix(
 
     work = period_df.copy()
     work["sku_code"] = work["sku_code"].astype(str).str.strip().str.upper()
+    if "web_purchased" not in work.columns and "web_purchases" in work.columns:
+        work["web_purchased"] = work["web_purchases"]
 
     for col in ("web_views", "web_clicks", "web_atc", "web_purchased", "web_revenue", "oms_units", "perf_users", "perf_units"):
         if col not in work.columns:
@@ -153,6 +155,8 @@ def build_feature_matrix(
     if master_df is not None and not master_df.empty:
         m = master_df.copy()
         m["sku_code"] = m["sku_code"].astype(str).str.strip().str.upper()
+        if "master_title" not in m.columns and "title" in m.columns:
+            m["master_title"] = m["title"]
         m = m.drop_duplicates(subset=["sku_code"], keep="first")
         agg = agg.merge(m, on="sku_code", how="left", suffixes=("", "_master"))
     else:

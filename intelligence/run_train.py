@@ -102,6 +102,21 @@ def _print_report(scored: pd.DataFrame, metrics: Dict[str, Any]) -> None:
             )
 
 
+SKU_INTELLIGENCE_SCORES_COLS = (
+    "sku_code",
+    "perf_sell_prob",
+    "oms_sell_prob",
+    "breakout_score",
+    "tier",
+    "trend_3m",
+    "top_drivers",
+    "design_tags",
+    "feature_snapshot",
+    "model_version",
+    "scored_at",
+)
+
+
 def _push_scores_to_supabase(scored: pd.DataFrame) -> None:
     from supabase import create_client
 
@@ -114,11 +129,17 @@ def _push_scores_to_supabase(scored: pd.DataFrame) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     out = scored.copy()
     out["scored_at"] = now_iso
-    records = out.where(pd.notnull(out), None).to_dict(orient="records")
-    for rec in records:
-        for k, v in list(rec.items()):
-            if isinstance(v, float) and pd.isna(v):
-                rec[k] = None
+    allowed = set(SKU_INTELLIGENCE_SCORES_COLS)
+    cols = [c for c in SKU_INTELLIGENCE_SCORES_COLS if c in out.columns]
+    raw_records = out[cols].where(pd.notnull(out[cols]), None).to_dict(orient="records")
+
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for rec in raw_records:
+        cleaned = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in rec.items() if k in allowed}
+        code = cleaned.get("sku_code")
+        if code:
+            deduped[str(code)] = cleaned
+    records = list(deduped.values())
 
     batch_size = 500
     for i in range(0, len(records), batch_size):

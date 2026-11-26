@@ -245,6 +245,26 @@ def train_and_score(
 
     top_drivers = _extract_top_drivers(perf_model, X_all, feat_df, top_k=4)
 
+    design_tags_col = feat_df.get("design_tags", pd.Series([{} for _ in range(len(feat_df))], index=feat_df.index))
+    parsed_design_tags = [
+        v if isinstance(v, dict) else {}
+        for v in design_tags_col
+    ]
+
+    feature_snapshots = [
+        {
+            "product_name": None if pd.isna(r.get("product_name")) else r.get("product_name"),
+            "category": str(r.get("category", "unknown")),
+            "avg_price": round(float(r.get("avg_price", 0.0)), 2),
+            "total_views": int(r.get("total_views", 0)),
+            "total_atc": int(r.get("total_atc", 0)),
+            "smoothed_atc_rate": round(float(r.get("smoothed_atc_rate", 0.0)), 4),
+            "perf_units": int(r.get("perf_units", 0)),
+            "oms_units": int(r.get("oms_units", 0)),
+        }
+        for _, r in feat_df.iterrows()
+    ]
+
     scored = pd.DataFrame(
         {
             "sku_code": feat_df["sku_code"],
@@ -259,7 +279,11 @@ def train_and_score(
             "perf_sell_prob": np.round(perf_probs, 4),
             "oms_sell_prob": np.round(oms_probs, 4),
             "breakout_score": breakout_score,
+            "trend_3m": np.round(feat_df["trend_3m"], 4),
             "top_drivers": top_drivers,
+            "design_tags": parsed_design_tags,
+            "feature_snapshot": feature_snapshots,
+            "model_version": "lgbm_v1",
         }
     )
     scored["tier"] = scored.apply(_assign_tier, axis=1)
