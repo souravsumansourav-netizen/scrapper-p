@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import pandas as pd
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from intelligence.etl import run_etl_pipeline
 
@@ -21,6 +23,14 @@ def _get_supabase_client() -> Any:
     return create_client(url, key)
 
 
+def _normalize_r2_endpoint(endpoint: str, bucket: str) -> str:
+    cleaned = endpoint.strip().rstrip("/")
+    suffix = f"/{bucket.strip()}"
+    if cleaned.endswith(suffix):
+        cleaned = cleaned[: -len(suffix)]
+    return cleaned
+
+
 def _get_r2_client() -> Tuple[Any, str]:
     endpoint = os.environ.get("R2_ENDPOINT")
     access_key = os.environ.get("R2_ACCESS_KEY_ID")
@@ -30,14 +40,17 @@ def _get_r2_client() -> Tuple[Any, str]:
         raise RuntimeError(
             "R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET_NAME must be set."
         )
+    bucket_name = str(bucket).strip()
+    normalized_endpoint = _normalize_r2_endpoint(str(endpoint), bucket_name)
     s3 = boto3.client(
         "s3",
-        endpoint_url=endpoint,
+        endpoint_url=normalized_endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="auto",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
-    return s3, str(bucket)
+    return s3, bucket_name
 
 
 def _df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -60,6 +73,7 @@ def _batch_source_type(batch: Dict[str, Any]) -> str:
 
 
 def _fetch_pending_batches(client: Any, batch_id: Optional[str]) -> List[Dict[str, Any]]:
+    retryable_statuses = ["uploaded", "error"]
     if batch_id:
         target_resp = (
             client.table("intel_upload_batches")
@@ -72,26 +86,29 @@ def _fetch_pending_batches(client: Any, batch_id: Optional[str]) -> List[Dict[st
         if not rows:
             return []
         target = rows[0]
+        target_allowed = target.get("status") in ("uploaded", "error", "processing")
         p_start = target.get("period_start")
         p_end = target.get("period_end")
         if p_start and p_end:
             group_resp = (
                 client.table("intel_upload_batches")
                 .select("*")
-                .eq("status", "uploaded")
+                .in_("status", retryable_statuses)
                 .eq("period_start", p_start)
                 .eq("period_end", p_end)
                 .order("created_at", desc=False)
                 .execute()
             )
-            group_rows = group_resp.data or []
-            return group_rows if group_rows else ([target] if target.get("status") == "uploaded" else [])
-        return [target] if target.get("status") == "uploaded" else []
+            group_rows = list(group_resp.data or [])
+            if target_allowed and all(r.get("id") != target.get("id") for r in group_rows):
+                group_rows.append(target)
+            return group_rows
+        return [target] if target_allowed else []
 
     resp = (
         client.table("intel_upload_batches")
         .select("*")
-        .eq("status", "uploaded")
+        .in_("status", retryable_statuses)
         .order("created_at", desc=False)
         .execute()
     )
@@ -120,7 +137,15 @@ def _process_group(
                 src_type = _batch_source_type(b)
                 r2_key = b["r2_key"]
                 local_file = tmp_path / f"{b['id']}_{Path(r2_key).name}"
-                s3.download_file(bucket, r2_key, str(local_file))
+                try:
+                    s3.download_file(bucket, r2_key, str(local_file))
+                except ClientError as ce:
+                    endpoint_url = getattr(getattr(s3, "meta", None), "endpoint_url", None)
+                    print(
+                        f"R2 ClientError downloading bucket={bucket!r} r2_key={r2_key!r} "
+                        f"endpoint_url={endpoint_url!r}: {ce}"
+                    )
+                    raise
                 if src_type in {"web", "oms", "perf", "master"}:
                     paths_by_type[src_type] = str(local_file)
 
