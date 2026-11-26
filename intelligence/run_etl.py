@@ -8,7 +8,12 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from intelligence.etl import ETLStats, run_etl_pipeline
+from intelligence.etl import (
+    ETLStats,
+    prepare_master_attribute_records,
+    prepare_period_metrics_records,
+    run_etl_pipeline,
+)
 
 TMP_DIR = Path(__file__).parent / "tmp"
 
@@ -106,13 +111,13 @@ def _push_to_supabase(period_df: pd.DataFrame, master_attrs_df: pd.DataFrame) ->
     client = create_client(url, key)
     batch_size = 500
 
-    master_records = _df_to_records(master_attrs_df)
+    master_records = prepare_master_attribute_records(master_attrs_df)
     for i in range(0, len(master_records), batch_size):
         chunk = master_records[i : i + batch_size]
         client.table("sku_master_attributes").upsert(chunk, on_conflict="sku_code").execute()
     print(f"Upserted {len(master_records)} rows into sku_master_attributes.")
 
-    period_records = _df_to_records(period_df)
+    period_records = prepare_period_metrics_records(period_df)
     for i in range(0, len(period_records), batch_size):
         chunk = period_records[i : i + batch_size]
         client.table("sku_period_metrics").upsert(

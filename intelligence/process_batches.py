@@ -10,7 +10,11 @@ import pandas as pd
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from intelligence.etl import run_etl_pipeline
+from intelligence.etl import (
+    prepare_master_attribute_records,
+    prepare_period_metrics_records,
+    run_etl_pipeline,
+)
 
 
 def _get_supabase_client() -> Any:
@@ -161,7 +165,7 @@ def _process_group(
 
             batch_size = 500
             if not master_attrs_df.empty:
-                master_records = _df_to_records(master_attrs_df)
+                master_records = prepare_master_attribute_records(master_attrs_df)
                 for i in range(0, len(master_records), batch_size):
                     client.table("sku_master_attributes").upsert(
                         master_records[i : i + batch_size],
@@ -169,7 +173,7 @@ def _process_group(
                     ).execute()
 
             if not period_df.empty and period_start and period_end:
-                period_records = _df_to_records(period_df)
+                period_records = prepare_period_metrics_records(period_df)
                 for i in range(0, len(period_records), batch_size):
                     client.table("sku_period_metrics").upsert(
                         period_records[i : i + batch_size],
