@@ -17,19 +17,20 @@ import pandas as pd
 
 from intelligence.categories import canonical_category
 from intelligence.design_dna import DESIGN_AXES
+from intelligence.name_attributes import attributes_from_name, normalize_metal_color
 
 CAT_FEATURES = [
     "category",
     "jewellery_type",
+    "stone",
     "metal",
     "metal_color",
     "gold_karatage",
-    "occasion",
-    "collection",
     "gender",
-    "weight_band",
     "is_new_collection",
 ]
+# Not used: collection, occasion and weight_band exist only in the master report, which
+# covers ~9% of winners, so they mostly encode "is in the master file" rather than taste.
 
 NUM_FEATURES = [
     "log_views_total",
@@ -110,6 +111,34 @@ def _price_band_from_price(price: float) -> Optional[str]:
     return "over_100k"
 
 
+NAME_FILLED_COLS = ("metal", "gold_karatage", "metal_color", "jewellery_type", "gender")
+
+
+def fill_attributes_from_names(df: pd.DataFrame) -> None:
+    """Fill metal / karatage / colour / type / gender from the product name where the master
+    has nothing, and add a `stone` attribute (diamond / gemstone / pearl / none).
+
+    Most best sellers are gold pieces missing from the master report; without this the
+    model sees "unknown" for them and learns "unknown = winner" instead of "gold = winner".
+    """
+    parsed = [attributes_from_name(n) for n in df["product_name"]]
+    for col in NAME_FILLED_COLS:
+        master_vals = df[col] if col in df.columns else pd.Series(None, index=df.index)
+        if col == "metal_color":
+            master_vals = master_vals.map(normalize_metal_color)
+        cleaned = master_vals.astype(str).str.strip()
+        missing = master_vals.isna() | cleaned.str.lower().isin({"", "unknown", "nan", "none", "null"})
+        from_name = pd.Series([p.get(col) for p in parsed], index=df.index)
+        df[col] = master_vals.where(~missing, from_name)
+    stone = pd.Series([p.get("stone", "none") if str(n or "").strip() else None for p, n in zip(parsed, df["product_name"])], index=df.index)
+    # A master "Diamond Jewellery" item is a diamond piece even if its name doesn't say so.
+    stone = stone.where(~((df["jewellery_type"] == "Diamond Jewellery") & (stone == "none")), "diamond")
+    df["stone"] = stone
+    # Absent from the master means "not flagged", not a separate category.
+    if "is_new_collection" in df.columns:
+        df["is_new_collection"] = df["is_new_collection"].map(lambda v: "yes" if _to_bool(v) else "no")
+
+
 def latest_period(period_df: pd.DataFrame) -> pd.DataFrame:
     """Return rows of the most recent period only."""
     if "period_start" not in period_df.columns:
@@ -168,6 +197,8 @@ def build_feature_frame(
     df["category"] = [
         canonical_category(c, mc, name=n) for c, mc, n in zip(df["category"], master_cat, df["product_name"])
     ]
+
+    fill_attributes_from_names(df)
 
     # --- Traffic & intent (no purchases) ---
     df["views_total"] = df["web_views"] + df["app_views"]

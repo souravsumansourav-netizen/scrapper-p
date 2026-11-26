@@ -119,6 +119,15 @@ def _driver_text(feat: str, row: pd.Series) -> str:
         if pd.isna(v):
             return "Price unknown"
         return "Lower-priced for its category" if float(v) < 0.5 else "Higher-priced for its category"
+    if feat == "stone":
+        return {
+            "none": "Plain metal, no stones",
+            "diamond": "Has diamonds",
+            "gemstone": "Has gemstones",
+            "pearl": "Has pearls",
+        }.get(str(row.get(feat)), f"Stone: {row.get(feat)}")
+    if feat == "gold_karatage":
+        return f"{row.get(feat)} karat"
     if feat.startswith("dna_"):
         _, axis, term = feat.split("_", 2)
         return f"{axis.capitalize()}: {term.replace('_', ' ')}"
@@ -210,14 +219,14 @@ def train_and_score(
         )
         drivers[i] = [reason] + drivers[i][:3]
 
-    snap_cols = ["product_name", "views_total", "web_views", "app_views", "atc_total", "atc_rate_smoothed",
+    snap_cols = ["product_name", "metal", "gold_karatage", "stone", "jewellery_type", "views_total", "web_views", "app_views", "atc_total", "atc_rate_smoothed",
                  "units_sold", "oms_units", "price_band", "live_price"]
     snapshots = []
     for _, r in frame.iterrows():
         snap = {}
         for c in snap_cols:
             v = r.get(c)
-            if v is None or (isinstance(v, float) and pd.isna(v)):
+            if v is None or (isinstance(v, float) and pd.isna(v)) or str(v) == "unknown":
                 continue
             snap[c] = round(float(v), 4) if isinstance(v, (int, float, np.floating, np.integer)) else str(v)
         snapshots.append(snap)
