@@ -605,3 +605,95 @@ def run_etl_pipeline(
 
     return period_df, master_attrs_df, stats
 
+
+SKU_PERIOD_METRICS_COLS = (
+    "sku_code",
+    "period_start",
+    "period_end",
+    "granularity",
+    "product_name",
+    "category",
+    "price_range",
+    "avg_price",
+    "web_clicks",
+    "web_views",
+    "web_atc",
+    "web_purchases",
+    "web_revenue",
+    "web_atc_rate",
+    "web_conv_rate",
+    "web_cart_abandon_rate",
+    "oms_units",
+    "oms_revenue_inr",
+    "oms_rev_share",
+    "perf_users",
+    "perf_units",
+    "match_tier",
+)
+
+SKU_MASTER_ATTRIBUTES_COLS = (
+    "sku_code",
+    "base_sku_13",
+    "title",
+    "category",
+    "collection",
+    "metal",
+    "gold_karatage",
+    "metal_color",
+    "jewellery_type",
+    "occasion",
+    "diamond_clarity",
+    "weight_band",
+    "design",
+    "styling",
+    "is_new_collection",
+    "is_best_deal",
+    "short_description",
+    "long_description",
+    "design_tags",
+    "image_url",
+)
+
+
+def _clean_record_nans(rec: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in list(rec.items()):
+        if isinstance(v, float) and pd.isna(v):
+            rec[k] = None
+    return rec
+
+
+def prepare_period_metrics_records(period_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Map and filter period_df rows to the exact sku_period_metrics SQL columns."""
+    if period_df.empty:
+        return []
+    df = period_df.rename(
+        columns={
+            "web_purchased": "web_purchases",
+            "oms_revenue": "oms_revenue_inr",
+            "oms_revenue_ratio": "oms_rev_share",
+            "master_match_tier": "match_tier",
+        }
+    )
+    allowed = set(SKU_PERIOD_METRICS_COLS)
+    cols = [c for c in SKU_PERIOD_METRICS_COLS if c in df.columns]
+    records = df[cols].where(pd.notnull(df[cols]), None).to_dict(orient="records")
+    return [_clean_record_nans({k: v for k, v in r.items() if k in allowed}) for r in records]
+
+
+def prepare_master_attribute_records(master_attrs_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Map and filter master_attrs_df rows to the exact sku_master_attributes SQL columns."""
+    if master_attrs_df.empty:
+        return []
+    df = master_attrs_df.rename(
+        columns={
+            "master_title": "title",
+            "karatage": "gold_karatage",
+            "product_type": "jewellery_type",
+        }
+    )
+    allowed = set(SKU_MASTER_ATTRIBUTES_COLS)
+    cols = [c for c in SKU_MASTER_ATTRIBUTES_COLS if c in df.columns]
+    records = df[cols].where(pd.notnull(df[cols]), None).to_dict(orient="records")
+    return [_clean_record_nans({k: v for k, v in r.items() if k in allowed}) for r in records]
+
+
