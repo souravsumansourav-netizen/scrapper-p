@@ -2,6 +2,8 @@ name: Scrape SKUs
 
 on:
   schedule:
+    # Backup only. GitHub often starts schedules hours late; the on-time trigger is the
+    # Supabase pg_cron job (migration 0021) that dispatches this workflow at 12:00 IST.
     - cron: '30 6 * * *' # 12:00 Noon IST daily (06:30 UTC)
   workflow_dispatch:
     inputs:
@@ -26,6 +28,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # the worker stops starting new SKUs at 330 min
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

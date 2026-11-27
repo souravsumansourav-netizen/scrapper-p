@@ -77,13 +77,10 @@ def _collect_queued_skus(client: Any) -> List[Dict[str, Optional[str]]]:
     """Return deduplicated list of {sku_code, product_url} where scrape_status = 'queued'."""
     targets: Dict[str, Optional[str]] = {}
 
-    queued_resp = (
-        client.table("sku_market_data")
-        .select("sku_code, product_url")
-        .eq("scrape_status", "queued")
-        .execute()
+    queued_rows = _fetch_all(
+        client, "sku_market_data", "sku_code, product_url", lambda q: q.eq("scrape_status", "queued")
     )
-    for row in queued_resp.data or []:
+    for row in queued_rows:
         code = (row.get("sku_code") or "").strip().upper()
         if code and code not in targets:
             targets[code] = row.get("product_url")
@@ -91,43 +88,107 @@ def _collect_queued_skus(client: Any) -> List[Dict[str, Optional[str]]]:
     return [{"sku_code": code, "product_url": url} for code, url in targets.items()]
 
 
-def _collect_daily_skus(client: Any) -> List[Dict[str, Optional[str]]]:
-    """Return deduplicated untriaged SKUs whose scraped_at is null or older than today 12:00 PM IST."""
-    cutoff_utc = _today_noon_ist_utc()
+PAGE_SIZE = 1000  # Supabase returns at most 1,000 rows per request
+LOOKUP_CHUNK = 200  # SKU codes per `in` lookup, keeps request URLs short
 
-    untriaged_resp = client.table("skus").select("sku_code").eq("triaged", False).execute()
-    untriaged_codes: List[str] = []
-    seen = set()
-    for row in untriaged_resp.data or []:
-        code = (row.get("sku_code") or "").strip().upper()
-        if code and code not in seen:
-            seen.add(code)
-            untriaged_codes.append(code)
+# Intelligence SKUs worth keeping fresh: every tier except Low Potential, plus the
+# top of each category. ~1,000-1,500 SKUs; all 13k would take ~25h at ~7s per SKU.
+INTEL_TIERS = ("Proven Winner", "Rising Star", "Fading Winner", "Hidden Gem", "Watchlist")
+INTEL_TOP_PER_CATEGORY = 50
 
-    if not untriaged_codes:
+
+def _fetch_all(client: Any, table: str, columns: str, apply_filters=None) -> List[Dict[str, Any]]:
+    """Read every matching row, page by page (a single select stops at 1,000 rows)."""
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        query = client.table(table).select(columns)
+        if apply_filters is not None:
+            query = apply_filters(query)
+        batch = query.order("sku_code").range(offset, offset + PAGE_SIZE - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows
+        offset += PAGE_SIZE
+
+
+def _market_rows(client: Any, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Look up sku_market_data for many codes in small chunks."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(codes), LOOKUP_CHUNK):
+        resp = (
+            client.table("sku_market_data")
+            .select("sku_code, product_url, scraped_at")
+            .in_("sku_code", codes[i : i + LOOKUP_CHUNK])
+            .execute()
+        )
+        for r in resp.data or []:
+            code = (r.get("sku_code") or "").strip().upper()
+            if code:
+                out[code] = r
+    return out
+
+
+def _last_noon_ist_utc() -> datetime:
+    """Most recent 12:00 PM IST that has already passed (a late run after midnight
+    should not treat everything scraped yesterday afternoon as stale)."""
+    noon = _today_noon_ist_utc()
+    return noon if datetime.now(timezone.utc) >= noon else noon - timedelta(days=1)
+
+
+def _stale_targets(client: Any, codes: List[str], cutoff_utc: datetime) -> List[Dict[str, Optional[str]]]:
+    """Codes never scraped, or scraped before the cutoff. Never-scraped first, then oldest first."""
+    market = _market_rows(client, codes)
+    never, stale = [], []
+    for code in codes:
+        row = market.get(code)
+        scraped_dt = _parse_iso(row.get("scraped_at")) if row else None
+        item = {"sku_code": code, "product_url": row.get("product_url") if row else None}
+        if scraped_dt is None:
+            never.append(item)
+        elif scraped_dt < cutoff_utc:
+            stale.append((scraped_dt, item))
+    stale.sort(key=lambda t: t[0])
+    return never + [item for _, item in stale]
+
+
+def _dedupe_codes(rows: List[Dict[str, Any]]) -> List[str]:
+    return list(dict.fromkeys(
+        code for code in ((r.get("sku_code") or "").strip().upper() for r in rows) if code
+    ))
+
+
+def _collect_intel_codes(client: Any) -> List[str]:
+    """Intelligence SKUs to keep fresh: non-Low-Potential tiers plus each category's top N."""
+    try:
+        rows = _fetch_all(client, "sku_intelligence_scores", "sku_code, tier, category_rank")
+    except Exception as exc:  # noqa: BLE001 - intelligence tables may not exist yet
+        print(f"(skipping intelligence SKUs: {exc})")
         return []
+    wanted = [
+        r for r in rows
+        if r.get("tier") in INTEL_TIERS
+        or (r.get("category_rank") is not None and int(r["category_rank"]) <= INTEL_TOP_PER_CATEGORY)
+    ]
+    return _dedupe_codes(wanted)
 
-    market_resp = (
-        client.table("sku_market_data")
-        .select("sku_code, product_url, scraped_at")
-        .in_("sku_code", untriaged_codes)
-        .execute()
+
+def _collect_daily_skus(client: Any, include_intel: bool = True) -> List[Dict[str, Optional[str]]]:
+    """Untriaged Triage SKUs first, then priority Intelligence SKUs, each not scraped since the last 12:00 PM IST."""
+    cutoff_utc = _last_noon_ist_utc()
+
+    untriaged_codes = _dedupe_codes(
+        _fetch_all(client, "skus", "sku_code", lambda q: q.eq("triaged", False))
     )
-    market_by_code = {
-        (r.get("sku_code") or "").strip().upper(): r
-        for r in (market_resp.data or [])
-        if r.get("sku_code")
-    }
+    targets = _stale_targets(client, untriaged_codes, cutoff_utc) if untriaged_codes else []
+    print(f"Triage: {len(untriaged_codes)} untriaged SKU(s), {len(targets)} due for scraping.")
 
-    targets: List[Dict[str, Optional[str]]] = []
-    for code in untriaged_codes:
-        market_row = market_by_code.get(code)
-        if market_row is None:
-            targets.append({"sku_code": code, "product_url": None})
-            continue
-        scraped_dt = _parse_iso(market_row.get("scraped_at"))
-        if scraped_dt is None or scraped_dt < cutoff_utc:
-            targets.append({"sku_code": code, "product_url": market_row.get("product_url")})
+    if include_intel:
+        in_triage = set(untriaged_codes)
+        intel_codes = [c for c in _collect_intel_codes(client) if c not in in_triage]
+        intel_targets = _stale_targets(client, intel_codes, cutoff_utc) if intel_codes else []
+        print(f"Intelligence: {len(intel_codes)} priority SKU(s), {len(intel_targets)} due for scraping.")
+        targets.extend(intel_targets)
 
     return targets
 
@@ -284,6 +345,17 @@ def main() -> None:
         default="",
         help="Comma-separated SKU codes (used with --dry-run).",
     )
+    parser.add_argument(
+        "--no-intel",
+        action="store_true",
+        help="Daily mode: scrape Triage SKUs only, skip priority Intelligence SKUs.",
+    )
+    parser.add_argument(
+        "--max-minutes",
+        type=float,
+        default=330.0,
+        help="Stop starting new scrapes after this many minutes (GitHub jobs are killed at 360).",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -305,10 +377,20 @@ def main() -> None:
     if reset_count:
         print(f"Reset {reset_count} stale 'running' SKU(s) back to 'queued'.")
 
-    targets = _collect_queued_skus(client) if args.mode == "queued" else _collect_daily_skus(client)
+    targets = (
+        _collect_queued_skus(client)
+        if args.mode == "queued"
+        else _collect_daily_skus(client, include_intel=not args.no_intel)
+    )
     print(f"[mode={args.mode}] Found {len(targets)} unique SKU(s) to process.")
 
+    # Stop cleanly before GitHub's 6-hour job limit; tomorrow's run picks up the rest
+    # (never-scraped and oldest first).
+    deadline = time.monotonic() + args.max_minutes * 60
     for idx, item in enumerate(targets, start=1):
+        if time.monotonic() >= deadline:
+            print(f"Time budget of {args.max_minutes} min reached; {len(targets) - idx + 1} SKU(s) left for the next run.")
+            break
         if idx > 1:
             time.sleep(random.uniform(1.5, 3.0))
         code = item["sku_code"]
